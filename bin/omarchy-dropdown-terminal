@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# omarchy-dropdown-terminal — control the persistent drop-down terminal.
+# argv-only exec; no eval, no shell=True anywhere.
+set -euo pipefail
+
+PLUGIN_ID="meviusisback.dropdown-terminal"
+APP_ID="org.omarchy.dropdown-terminal"
+UNIT="foot-server@dropdown-terminal.service"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+BACKEND="$SCRIPT_DIR/../backend/dropdown_terminal.py"
+
+msg() { printf '%s\n' "$*"; }
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+server_active() { systemctl --user is-active --quiet "$UNIT"; }
+
+ensure_server() {
+  if ! server_active; then
+    systemctl --user start "$UNIT"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      if server_active; then return 0; fi
+      sleep 0.2
+    done
+    die "foot server ($UNIT) failed to start"
+  fi
+}
+
+# Exit 0 if the special workspace "special:dropdown" is currently shown.
+dropdown_visible() {
+  hyprctl monitors -j | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    sys.exit(1)
+for m in data:
+    name = ((m.get("specialWorkspace") or {}).get("name") or "")
+    if name.endswith("dropdown"):
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+# Count clients of the dropdown foot window.
+client_count() {
+  hyprctl clients -j | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    print(0)
+    sys.exit(0)
+n = 0
+for c in data:
+    if c.get("class") == "org.omarchy.dropdown-terminal":
+        n += 1
+print(n)
+' 2>/dev/null || echo 0
+}
+
+# ---------------------------------------------------------------- actions
+
+spawn_client() {
+  # footclient attaches to the persistent server and creates the window.
+  # The server itself creates no window until a client connects, so the
+  # first summon must spawn one; later summons reuse the existing window.
+  setsid footclient --server-socket="$(server_socket)" >/dev/null 2>&1 &
+  disown || true
+}
+
+do_open() {
+  ensure_server
+  if [[ "$(client_count)" -eq 0 ]]; then
+    spawn_client
+    local i
+    for i in 1 2 3 4 5; do
+      [[ "$(client_count)" -ge 1 ]] && break
+      sleep 0.2
+    done
+  fi
+  if ! dropdown_visible; then
+    hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+  fi
+}
+
+do_close() {
+  if dropdown_visible; then
+    hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+  fi
+}
+
+do_toggle() {
+  if dropdown_visible; then
+    do_close
+  else
+    do_open
+  fi
+}
+
+do_kill() {
+  systemctl --user stop "$UNIT"
+}
+
+do_status() {
+  python3 "$BACKEND" status
+}
+
+do_install() {
+  [[ -x /usr/bin/foot ]] || die "foot not found at /usr/bin/foot"
+  python3 "$BACKEND" install
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$UNIT"
+  hyprctl reload
+  msg "Installed. Press SUPER + U to drop the terminal."
+}
+
+do_uninstall() {
+  python3 "$BACKEND" uninstall
+  systemctl --user daemon-reload
+  hyprctl reload
+  msg "Uninstalled (keybind, rules, unit, server all removed)."
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-dropdown-terminal [command]
+
+commands:
+  toggle      show/hide the drop-down terminal (default)
+  open        show it if hidden
+  close       hide it if shown
+  status      print JSON state (server, window, visibility)
+  kill        stop the foot server (session ends)
+  install     install keybind + rules + systemd unit
+  uninstall   remove everything the plugin installed
+EOF
+}
+
+main() {
+  local cmd="${1:-toggle}"
+  case "$cmd" in
+    toggle)    do_toggle ;;
+    open)      do_open ;;
+    close)     do_close ;;
+    status)    do_status ;;
+    kill)      do_kill ;;
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $cmd (see --help)" ;;
+  esac
+}
+
+main "$@"

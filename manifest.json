@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "meviusisback.dropdown-terminal",
+  "name": "Drop-down terminal",
+  "version": "0.1.0",
+  "author": "meviusisback",
+  "license": "MIT",
+  "description": "Quake-style drop-down terminal on SUPER+U: a persistent foot server session that slides down from the top of any workspace, with bar toggle, IPC control, and clean install/uninstall.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Drop-down terminal",
+    "description": "Toggle a persistent Quake-style drop-down terminal (foot server session on a special workspace).",
+    "category": "Compositor",
+    "aliases": [
+      "dropdown",
+      "quake-terminal",
+      "terminal-dropdown"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "keybind": "SUPER + U"
+    },
+    "schema": [
+      {
+        "key": "keybind",
+        "type": "string",
+        "label": "Keybind (informational)",
+        "defaultValue": "SUPER + U",
+        "description": "The Hyprland keybind that toggles the drop-down terminal. Set at install time; shown here for reference."
+      }
+    ]
+  }
+}
