@@ -61,6 +61,10 @@ print(n)
 
 # ---------------------------------------------------------------- actions
 
+server_socket() {
+  printf '%s/foot-dropdown-terminal.sock' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+}
+
 spawn_client() {
   # footclient attaches to the persistent server and creates the window.
   # The server itself creates no window until a client connects, so the
@@ -69,8 +73,82 @@ spawn_client() {
   disown || true
 }
 
+window_in_special() {
+  hyprctl clients -j | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    sys.exit(1)
+for c in data:
+    if c.get("class") == "org.omarchy.dropdown-terminal":
+        ws = (c.get("workspace") or {}).get("name") or ""
+        sys.exit(0 if ws.startswith("special:") else 1)
+sys.exit(1)
+'
+}
+
+# Exit 0 if the dropdown window is the active window.
+active_is_dropdown() {
+  hyprctl activewindow -j | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    sys.exit(1)
+sys.exit(0 if (d or {}).get("class") == "org.omarchy.dropdown-terminal" else 1)
+'
+}
+
+# Print "ADDRESS PINNED" for the first dropdown window ("" if none).
+dropdown_pin_state() {
+  hyprctl clients -j | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    sys.exit(0)
+for c in data:
+    if c.get("class") == "org.omarchy.dropdown-terminal":
+        print(c.get("address", ""), str(c.get("pinned", False)).lower())
+        sys.exit(0)
+' 2>/dev/null || true
+}
+
+unpin_if_pinned() {
+  # Pin toggle flips state, so only toggle when we know it is pinned.
+  local addr pinned
+  read -r addr pinned <<<"$(dropdown_pin_state)"
+  if [[ -n "$addr" && "$pinned" == "true" ]]; then
+    hyprctl dispatch "hl.dsp.window.pin(\"$addr\")" >/dev/null 2>&1 || true
+    sleep 0.2
+  fi
+}
+
+pull_window_into_special() {
+  # Move the dropdown window into special:dropdown. This engine's dispatchers
+  # only act on the ACTIVE window, so this must only run while the dropdown
+  # is focused (fresh spawns always are). Unpin first: a pinned window
+  # refuses the move. Verifies the result; exits 0 on success.
+  active_is_dropdown || return 1
+  unpin_if_pinned
+  hyprctl dispatch 'hl.dsp.window.move({ workspace = "special:dropdown" })' >/dev/null 2>&1 || true
+  local i
+  for i in 1 2 3; do
+    window_in_special && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
 do_open() {
   ensure_server
+  # Show the special workspace FIRST so a fresh client's workspace rule has
+  # a visible target (spawning while it is hidden is what stranded windows).
+  if ! dropdown_visible; then
+    hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+    sleep 0.2
+  fi
   if [[ "$(client_count)" -eq 0 ]]; then
     spawn_client
     local i
@@ -78,20 +156,33 @@ do_open() {
       [[ "$(client_count)" -ge 1 ]] && break
       sleep 0.2
     done
+    # Let the fresh window map and take focus.
+    sleep 0.4
   fi
-  if ! dropdown_visible; then
+  # A window that spawned while the rules could not place it may be stranded
+  # on a normal workspace; pull it into the special workspace.
+  if ! window_in_special; then
+    pull_window_into_special || true
+  fi
+  # Show it once it is where it belongs (guarded against double-toggle).
+  if window_in_special && ! dropdown_visible; then
     hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
 
 do_close() {
+  # Hide = toggle the special workspace away. If the window is stranded on
+  # a normal workspace, pull it in first so the toggle actually hides it.
+  if [[ "$(client_count)" -ge 1 ]] && ! window_in_special; then
+    pull_window_into_special || true
+  fi
   if dropdown_visible; then
     hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
 
 do_toggle() {
-  if dropdown_visible; then
+  if dropdown_visible && window_in_special; then
     do_close
   else
     do_open

@@ -20,6 +20,7 @@ python3 -c "import py_compile; py_compile.compile('$BACKEND', doraise=True)" || 
 if [[ "${1:-install}" == "uninstall" ]]; then
   python3 "$BACKEND" uninstall
   systemctl --user daemon-reload
+  rm -f "$HOME/.local/bin/omarchy-dropdown-terminal"
   hyprctl reload 2>/dev/null || true
   msg "Uninstalled. All plugin traces removed."
   exit 0
@@ -29,6 +30,8 @@ msg "Installing drop-down terminal..."
 python3 "$BACKEND" install
 systemctl --user daemon-reload
 systemctl --user enable --now "$UNIT"
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$SCRIPT_DIR/bin/omarchy-dropdown-terminal" "$HOME/.local/bin/omarchy-dropdown-terminal"
 hyprctl reload 2>/dev/null || true
 
 msg ""

@@ -32,10 +32,19 @@ class BackendTest(unittest.TestCase):
         self.assertIn(backend.RULES_END, backend.RULES_BODY)
         self.assertIn('o.window("org.omarchy.dropdown-terminal"', backend.RULES_BODY)
         self.assertIn("special:dropdown", backend.RULES_BODY)
+        self.assertIn("float = true", backend.RULES_BODY)
+
+    def test_rules_body_must_not_pin_or_steal_focus(self):
+        # Regression: pin=true + stay_focused=true let a window that spawned
+        # while the special workspace was hidden become an always-on-top
+        # overlay on every workspace that no toggle could hide (real trap on
+        # the live host). The generated rules must never contain them.
+        self.assertNotIn("pin = true", backend.RULES_BODY)
+        self.assertNotIn("stay_focused = true", backend.RULES_BODY)
 
     def test_bind_block_roundtrip(self):
         backend.atomic_write(backend.BINDINGS_LUA, "-- my binds\n")
-        body = backend.BIND_LINE.split("\n", 1)[1].rsplit("\n", 1)[0]
+        body = backend.BIND_BODY
         self.assertTrue(backend.append_block(backend.BINDINGS_LUA, backend.BIND_BEGIN, body, backend.BIND_END))
         content = backend.read_text(backend.BINDINGS_LUA)
         self.assertIn('o.bind("SUPER + U"', content)

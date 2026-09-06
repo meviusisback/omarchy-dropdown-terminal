@@ -72,18 +72,20 @@ RULES_BODY = f"""\
 {RULES_BEGIN}
 -- Drop-down terminal: full-width top panel on its own special workspace.
 -- Toggling the workspace plays Hyprland's specialWorkspace slidevert
--- animation; the window is pinned so it never joins the tiling flow.
+-- animation. Float + the workspace assignment keep it out of the tiling
+-- flow. NO pin/stay_focused: if a window ever spawns while the special
+-- workspace is hidden and misses the workspace assignment, pin would turn
+-- it into an always-on-top overlay on every workspace that no toggle can
+-- hide (and stay_focused would glue keyboard focus to it).
 local ddws = "special:{DROPDOWN_WS}"
 
 o.window("{DROPDOWN_APP_ID}", {{
   workspace = ddws,
   float = true,
-  pin = true,
   size = {{ "(monitor_w)", "(monitor_h*55/100)" }},
-  move = {{ "(monitor_w/2)", "(0-monitor_h*9/100)" }},
+  move = {{ "0", "(monitor_h*25/1000)" }},
   animation = "slide top",
   border_size = 0,
-  stay_focused = true,
 }})
 {RULES_END}
 """
@@ -97,11 +99,8 @@ HOOK_LINE = (
 
 BIND_BEGIN = f"-- BEGIN {MARKER}"
 BIND_END = f"-- END {MARKER}"
-BIND_LINE = (
-    f'{BIND_BEGIN}\n'
-    'o.bind("SUPER + U", "Toggle drop-down terminal", "omarchy-dropdown-terminal toggle")\n'
-    f'{BIND_END}\n'
-)
+BIND_BODY = 'o.bind("SUPER + U", "Toggle drop-down terminal", "omarchy-dropdown-terminal toggle")'
+BIND_LINE = f"{BIND_BEGIN}\n{BIND_BODY}\n{BIND_END}\n"
 BIND_TAG = "Toggle drop-down terminal"
 
 # ----------------------------------------------------------------- utilities
@@ -272,7 +271,7 @@ def install(quiet=False):
     if conflict:
         results["keybind"] = f"CONFLICT: SUPER + U already used by: {conflict}"
     else:
-        added = append_block(BINDINGS_LUA, BIND_BEGIN, BIND_LINE.split("\n", 1)[1].rsplit("\n", 1)[0], BIND_END)
+        added = append_block(BINDINGS_LUA, BIND_BEGIN, BIND_BODY, BIND_END)
         results["keybind"] = "added" if added else "already-installed"
 
     # 4. systemd unit + enable (enable skipped under DDT_TEST: hermetic tests).

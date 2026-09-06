@@ -33,7 +33,8 @@ Panel {
   property bool busy: false
 
   function scriptPath() {
-    return Qt.resolvedUrl("../bin/omarchy-dropdown-terminal").toString().replace(/^file:\/\//, "")
+    // bin/ is a sibling of Panel.qml inside the plugin folder.
+    return Qt.resolvedUrl("bin/omarchy-dropdown-terminal").toString().replace(/^file:\/\//, "")
   }
 
   function refresh() {
