@@ -1,10 +1,12 @@
 {
+  "$schema": "https://raw.githubusercontent.com/omarchy/omarchy/main/schemas/plugin.json",
   "schemaVersion": 1,
   "id": "meviusisback.dropdown-terminal",
   "name": "Drop-down terminal",
   "version": "0.1.0",
   "author": "meviusisback",
   "license": "MIT",
+  "repository": "https://github.com/meviusisback/omarchy-dropdown-terminal",
   "description": "Quake-style drop-down terminal on SUPER+U: a persistent foot server session that slides down from the top of any workspace, with bar toggle, IPC control, and clean install/uninstall.",
   "kinds": [
     "bar-widget"

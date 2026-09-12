@@ -31,12 +31,36 @@ switch, and even a shell restart.
 - **Clean install/uninstall** - one marker-anchored block in your Hyprland
   config, one line, one systemd unit. Uninstall removes every trace.
 
+## Requirements
+
+- **Omarchy** with its Hyprland build - toggling uses the Lua dispatch engine
+  (`hl.dsp.workspace.toggle_special`), not the legacy
+  `dispatch togglespecialworkspace` syntax.
+- **foot** - provides `foot` and `footclient` (Arch: `pacman -S foot`). The
+  persistent session is a foot *server*; your own foot config and windows stay
+  untouched, because the dropdown uses its own app-id and socket.
+- **systemd user instance** - the session lives in the user unit
+  `foot-server@dropdown-terminal.service`.
+- **python3** - standard library only. The install/uninstall backend and the
+  focus watcher use no third-party packages.
+- **omarchy-shell** - for the bar widget and the
+  `omarchy-shell shell toggle meviusisback.dropdown-terminal` IPC method.
+
+Everything runs in your own user session: no network access, no root, no
+long-lived daemon beyond the foot server unit.
+
 ## Install
 
 ```bash
-cd ~/.config/omarchy/plugins/meviusisback.dropdown-terminal   # (or the repo dir)
-./install.sh
+omarchy plugin add https://github.com/meviusisback/omarchy-dropdown-terminal
+omarchy plugin enable meviusisback.dropdown-terminal   # adds the bar widget
+cd ~/.config/omarchy/plugins/meviusisback.dropdown-terminal
+./install.sh                                           # keybind + rules + foot server
 ```
+
+`omarchy plugin add` only puts the files on disk; `./install.sh` is the part a
+plugin cannot do for itself (writing your Hyprland config and enabling a user
+unit).
 
 What it does:
 
@@ -55,7 +79,8 @@ What it does:
 ### Uninstall
 
 ```bash
-./install.sh uninstall
+./install.sh uninstall                               # keybind, rules, unit, server
+omarchy plugin remove meviusisback.dropdown-terminal # plugin files + bar entry
 ```
 
 Stops and disables the server (ordered to defeat the systemd respawn race),
