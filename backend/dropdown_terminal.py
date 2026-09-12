@@ -73,11 +73,30 @@ RULES_BODY = f"""\
 -- Drop-down terminal: centered floating panel on its own special workspace.
 -- Toggling the workspace plays Hyprland's specialWorkspace slidevert
 -- animation. Float + the workspace assignment keep it out of the tiling
--- flow. The special workspace blocks desktop interaction, so a focus
--- watcher (focus_watcher.py) auto-closes it when focus leaves the terminal.
--- NO pin/stay_focused: pin would turn a stray spawn into an always-on-top
--- overlay, and stay_focused would glue keyboard focus to it.
+-- flow. NO pin/stay_focused: pin would turn a stray spawn into an
+-- always-on-top overlay, and stay_focused would glue keyboard focus to it.
 local ddws = "special:{DROPDOWN_WS}"
+
+-- Two global input settings the dropdown needs (both reverted on uninstall):
+--
+-- special_fallthrough: a floating window on a special workspace otherwise
+--   blocks focusing regular windows ("having only floating windows in the
+--   special workspace will not block focusing windows in the regular
+--   workspace"), so a click outside the terminal would do nothing.
+-- follow_mouse = 0 / float_switch_override_focus = 0: make dismissal
+--   CLICK-based. With cursor-follows-focus on (the Omarchy default), merely
+--   moving the mouse over another window focuses it, so the dropdown would
+--   close on hover; with focus moved only by a click, the focus watcher
+--   (focus_watcher.py) closes it exactly when you click away.
+if hl and hl.config then
+  hl.config({{
+    input = {{
+      special_fallthrough = true,
+      follow_mouse = 0,
+      float_switch_override_focus = 0,
+    }},
+  }})
+end
 
 o.window("{DROPDOWN_APP_ID}", {{
   workspace = ddws,

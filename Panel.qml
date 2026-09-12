@@ -175,6 +175,16 @@ Panel {
     running: true
   }
 
+  // Restart the watcher if it ever exits (crash, or a stale instance holding
+  // the lock at load time). Without it a dead watcher silently disables
+  // click-outside-to-close until the shell is restarted.
+  Timer {
+    interval: 10000
+    repeat: true
+    running: true
+    onTriggered: if (!focusWatcher.running) focusWatcher.running = true
+  }
+
   Component.onCompleted: root.refresh()
   Component.onDestruction: focusWatcher.running = false
 }

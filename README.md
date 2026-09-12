@@ -1,10 +1,10 @@
 # Drop-down terminal (meviusisback.dropdown-terminal)
 
-A Quake-style drop-down terminal for Omarchy: press **SUPER + U** and a
-terminal slides down from the top of your screen, full width. Press again and
-it slides back up. The session is **persistent** - shell, scrollback and
-running programs survive every hide/show, workspace switch, and even a shell
-restart.
+A drop-down terminal for Omarchy: press **SUPER + U** and a terminal slides
+down from the top of your screen, centered and slightly narrower than the
+display. Press again and it slides back up. The session is **persistent** -
+shell, scrollback and running programs survive every hide/show, workspace
+switch, and even a shell restart.
 
 ![preview](preview.png)
 
@@ -16,9 +16,14 @@ restart.
 - **Real drop animation** - the terminal lives on its own special workspace
   at the top edge; toggling plays Hyprland's `specialWorkspace`
   slidevert animation (easeOutQuint) plus a `slide top` window rule.
-- **Quake geometry** - 100% width, 55% height, flush to the top, borderless.
-  Geometry is expressed in `monitor_w/H` formulas, so it adapts to any
-  monitor/resolution change without reinstalling.
+- **Centered geometry** - 80% width, 45% height, just below the top bar, with
+  a rounded 3px border. Geometry is expressed in `monitor_w/H` formulas, so it
+  adapts to any monitor/resolution change without reinstalling.
+- **Click outside to dismiss** - a focus watcher closes the dropdown the moment
+  it loses focus. Dismissal is click-based: the plugin sets
+  `input:follow_mouse = 0` and `float_switch_override_focus = 0` so moving the
+  mouse never steals focus, and `input:special_fallthrough` lets your click
+  reach the window underneath.
 - **Bar widget** - shows terminal state at a glance (accent = shown). Left
   click toggles, right click opens a small menu (show/hide, kill server).
 - **IPC control** - `omarchy-shell shell toggle meviusisback.dropdown-terminal`
@@ -100,6 +105,18 @@ your regular foot windows are untouched.
 - Wayland-only (Hyprland). X11 is not supported.
 - The bar widget reflects state on a 5 s poll; toggling via keybind updates
   it on the next tick.
+- Dismissal is **click-based**: clicking another window closes the dropdown and
+  focuses that window. Clicking *bare desktop background* (no window under the
+  cursor) raises no Hyprland event, and clicking the bar does not move keyboard
+  focus, so neither closes it - use `SUPER + U` for those.
+- The plugin sets three global input options in
+  `~/.config/hypr/dropdown-terminal.lua`: `special_fallthrough = true`,
+  `follow_mouse = 0` and `float_switch_override_focus = 0`. The last two turn
+  off hover-to-focus **for the whole desktop** (focus changes on click only) -
+  that is what makes dismissal click-based. Uninstall removes them. To keep
+  hover-to-focus, delete that `hl.config` block and set
+  `special_fallthrough = true` yourself; dismissal then reverts to
+  closing as soon as the mouse leaves the dropdown.
 
 ## License
 
