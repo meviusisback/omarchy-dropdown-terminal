@@ -95,6 +95,15 @@ Panel {
     function status(): void { root.refresh() }
   }
 
+  // ---------------- dropdown window background ----------------
+  Rectangle {
+    anchors.fill: parent
+    color: Color.background
+    radius: 8
+    border.width: 1
+    border.color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.15)
+  }
+
   // ---------------- bar button ----------------
   BarIconButton {
     id: button
@@ -159,5 +168,13 @@ Panel {
     }
   }
 
+  // ---------------- focus watcher (auto-close special ws when focus leaves) ----------------
+  Process {
+    id: focusWatcher
+    command: ["python3", Qt.resolvedUrl("backend/focus_watcher.py").toString().replace(/^file:\/\//, "")]
+    running: true
+  }
+
   Component.onCompleted: root.refresh()
+  Component.onDestruction: focusWatcher.running = false
 }

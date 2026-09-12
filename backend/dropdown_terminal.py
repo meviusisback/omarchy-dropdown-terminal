@@ -70,22 +70,23 @@ WantedBy=graphical-session.target
 
 RULES_BODY = f"""\
 {RULES_BEGIN}
--- Drop-down terminal: full-width top panel on its own special workspace.
+-- Drop-down terminal: centered floating panel on its own special workspace.
 -- Toggling the workspace plays Hyprland's specialWorkspace slidevert
 -- animation. Float + the workspace assignment keep it out of the tiling
--- flow. NO pin/stay_focused: if a window ever spawns while the special
--- workspace is hidden and misses the workspace assignment, pin would turn
--- it into an always-on-top overlay on every workspace that no toggle can
--- hide (and stay_focused would glue keyboard focus to it).
+-- flow. The special workspace blocks desktop interaction, so a focus
+-- watcher (focus_watcher.py) auto-closes it when focus leaves the terminal.
+-- NO pin/stay_focused: pin would turn a stray spawn into an always-on-top
+-- overlay, and stay_focused would glue keyboard focus to it.
 local ddws = "special:{DROPDOWN_WS}"
 
 o.window("{DROPDOWN_APP_ID}", {{
   workspace = ddws,
   float = true,
-  size = {{ "(monitor_w)", "(monitor_h*55/100)" }},
-  move = {{ "0", "(monitor_h*25/1000)" }},
+  size = {{ "(monitor_w*80/100)", "(monitor_h*45/100)" }},
+  move = {{ "(monitor_w*10/100)", "36" }},
   animation = "slide top",
-  border_size = 0,
+  border_size = 3,
+  rounding = 8,
 }})
 {RULES_END}
 """
