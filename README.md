@@ -13,9 +13,11 @@ switch, and even a shell restart.
 - **Persistent session** - powered by a `foot` terminal *server* (systemd user
   unit). Hiding the dropdown never kills your session; only logout or an
   explicit kill does. If the server ever dies, the next toggle self-heals it.
-- **Real drop animation** - the terminal lives on its own special workspace
-  at the top edge; toggling plays Hyprland's `specialWorkspace`
-  slidevert animation (easeOutQuint) plus a `slide top` window rule.
+- **Real drop animation, from the top** - the terminal lives on its own special
+  workspace at the top edge; toggling plays Hyprland's `specialWorkspace`
+  animation (easeOutQuint) with the direction pinned explicitly, so the panel
+  **drops in from the top** and retracts upward, instead of Hyprland's default
+  motion for special workspaces (a bare `slidevert` rises from the bottom).
 - **Centered geometry** - 80% width, 45% height, just below the top bar, with
   a rounded 3px border. Geometry is expressed in `monitor_w/H` formulas, so it
   adapts to any monitor/resolution change without reinstalling.
@@ -113,8 +115,8 @@ uninstall remove everything the plugin installed
 SUPER+U  ->  omarchy-dropdown-terminal toggle
               |-- systemctl --user start foot-server@dropdown-terminal (if dead)
               |-- footclient -> attaches to the persistent server
-              '-> hyprctl dispatch togglespecialworkspace dropdown
-                    (specialWorkspaceIn/Out slidevert animation)
+              '-> hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")'
+                    (specialWorkspaceIn/Out animation: drops in from the top)
 ```
 
 The foot server keeps ONE long-lived Wayland client alive. Every dropdown
@@ -142,6 +144,18 @@ your regular foot windows are untouched.
   hover-to-focus, delete that `hl.config` block and set
   `special_fallthrough = true` yourself; dismissal then reverts to
   closing as soon as the mouse leaves the dropdown.
+- The plugin also pins the drop direction for the `specialWorkspaceIn` and
+  `specialWorkspaceOut` animation leaves in that same generated file
+  (`slidevert top` on show, `slidevert bottom` on hide). Animations are global
+  per leaf, so **every** special workspace on that monitor - the Omarchy
+  scratchpad (`SUPER + S`) included - drops in from the top once installed; the
+  engine offers no per-workspace animation override. Uninstall removes the
+  block. Delete the `hl.animation` lines to get Hyprland's default motion back
+  (special workspaces rising from the bottom). Marking those two leaves also
+  detaches them from Omarchy's own `specialWorkspace` line: later changes there
+  (speed, bezier) no longer reach them, so revisit this block if you reshuffle
+  your animations. The bezier is Omarchy's curve - if it ever stops resolving,
+  `hyprctl configerrors` reports it and the direction simply is not applied.
 
 ## License
 

@@ -71,10 +71,12 @@ WantedBy=graphical-session.target
 RULES_BODY = f"""\
 {RULES_BEGIN}
 -- Drop-down terminal: centered floating panel on its own special workspace.
--- Toggling the workspace plays Hyprland's specialWorkspace slidevert
--- animation. Float + the workspace assignment keep it out of the tiling
--- flow. NO pin/stay_focused: pin would turn a stray spawn into an
--- always-on-top overlay, and stay_focused would glue keyboard focus to it.
+-- Toggling the workspace plays Hyprland's specialWorkspace animation, whose
+-- direction the hl.animation() calls below set to top/bottom so the panel
+-- DROPS IN from the top edge and retracts upward. Float + the workspace
+-- assignment keep it out of the tiling flow. NO pin/stay_focused: pin would
+-- turn a stray spawn into an always-on-top overlay, and stay_focused would
+-- glue keyboard focus to it.
 local ddws = "special:{DROPDOWN_WS}"
 
 -- Two global input settings the dropdown needs (both reverted on uninstall):
@@ -96,6 +98,30 @@ if hl and hl.config then
       float_switch_override_focus = 0,
     }},
   }})
+end
+
+-- Animation direction of the drop (global per leaf, reverted on uninstall).
+--
+-- The style string carries a direction token ("top"/"bottom"/"left"/"right")
+-- that overrides the direction the compositor passes in, and Hyprland starts a
+-- special workspace a screen BELOW on IN (Monitor.cpp: left = true), so
+-- Omarchy's bare "slidevert" default makes every special workspace rise from
+-- the bottom. IN with "top" begins one screen above and animates down to rest;
+-- OUT with "bottom" animates back up, i.e. it retracts the way it came.
+--
+-- Caution: hl.animation is per LEAF, so this restyles every special workspace
+-- on the monitor - the Omarchy scratchpad (SUPER + S) included. The engine has
+-- no per-workspace animation override. Setting these two leaves also marks them
+-- overridden, so they no longer inherit later changes to Omarchy's
+-- `specialWorkspace` line.
+--
+-- The bezier is Omarchy's own curve (defined in its looknfeel.lua, which loads
+-- before this file), so the motion matches the rest of the shell. A curve that
+-- fails to resolve is reported by `hyprctl configerrors`, and the direction pin
+-- would then simply not apply.
+if hl and hl.animation then
+  hl.animation({{ leaf = "specialWorkspaceIn", enabled = true, speed = 3, bezier = "easeOutQuint", style = "slidevert top" }})
+  hl.animation({{ leaf = "specialWorkspaceOut", enabled = true, speed = 3, bezier = "easeOutQuint", style = "slidevert bottom" }})
 end
 
 o.window("{DROPDOWN_APP_ID}", {{

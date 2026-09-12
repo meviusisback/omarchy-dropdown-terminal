@@ -7,6 +7,7 @@ HOME is repointed before the backend module is imported.
 
 import importlib
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,28 @@ class BackendTest(unittest.TestCase):
         # the live host). The generated rules must never contain them.
         self.assertNotIn("pin = true", backend.RULES_BODY)
         self.assertNotIn("stay_focused = true", backend.RULES_BODY)
+
+    def test_rules_body_pins_the_drop_direction(self):
+        # Regression: a bare `slidevert` keeps Hyprland's default for special
+        # workspaces, which starts one screen BELOW on IN (Monitor.cpp passes
+        # left = true) - the panel rose from the bottom. The direction token in
+        # the style string overrides that, so both leaves must carry one, and
+        # the out leaf must retract the way it came. Matched per animation call
+        # (not as one literal line) so reformatting RULES_BODY cannot fail a
+        # behaviour-neutral test.
+        for leaf, style in (
+            ("specialWorkspaceIn", "slidevert top"),
+            ("specialWorkspaceOut", "slidevert bottom"),
+        ):
+            pattern = (
+                r"hl\.animation\(\{[^}]*leaf = \"" + leaf + r"\"[^}]*"
+                r"style = \"" + style + r"\"[^}]*\}\)"
+            )
+            self.assertRegex(
+                backend.RULES_BODY,
+                pattern,
+                f"{leaf} must pin its drop direction ({style})",
+            )
 
     def test_bind_block_roundtrip(self):
         backend.atomic_write(backend.BINDINGS_LUA, "-- my binds\n")
