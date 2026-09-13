@@ -34,6 +34,10 @@ Panel {
   })
   property bool busy: false
 
+  // Set once the watcher's state file has been parsed at least once; until then
+  // the slow reconcile timer below stays active (see the fallback Timer).
+  property bool stateFileSeen: false
+
   // Where the watcher publishes visibility. Only an ABSOLUTE runtime dir is
   // accepted: an empty or relative value must never become a path at "/".
   readonly property string stateFile: {
@@ -58,14 +62,37 @@ Panel {
   function readState() {
     try {
       const parsed = JSON.parse(stateFileView.text() || "{}")
-      if (parsed && typeof parsed === "object" && typeof parsed.visible === "boolean")
+      if (parsed && typeof parsed === "object" && typeof parsed.visible === "boolean") {
+        root.stateFileSeen = true
         root.ddState = Object.assign({}, root.ddState, { visible: parsed.visible })
+      }
     } catch (e) { /* malformed or truncated: keep the previous state */ }
   }
 
   function scriptPath() {
     // bin/ is a sibling of Panel.qml inside the plugin folder.
     return Qt.resolvedUrl("bin/omarchy-dropdown-terminal").toString().replace(/^file:\/\//, "")
+  }
+
+  // Every automatic process is started with a CLEARED environment: /usr/bin/env -i
+  // drops the inherited environment (PATH included) and only the variables the CLI
+  // needs are passed back in explicitly. The tools themselves are then resolved to
+  // validated absolute paths inside the CLI. /usr/bin/env is the one hard-coded
+  // path here: something must be the first exec, and a root-owned system path is
+  // the honest place to stop.
+  readonly property var cliEnvPassthrough: [
+    "XDG_RUNTIME_DIR", "HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"
+  ]
+
+  function cliArgv(args) {
+    const argv = ["/usr/bin/env", "-i",
+                  "HOME=" + (Quickshell.env("HOME") || ""),
+                  "PATH=/usr/bin:/bin:/usr/local/bin"]
+    for (const name of root.cliEnvPassthrough) {
+      const value = Quickshell.env(name) || ""
+      if (value !== "") argv.push(name + "=" + value)
+    }
+    return argv.concat([root.scriptPath()], args)
   }
 
   function refresh() {
@@ -76,14 +103,14 @@ Panel {
   function runAction(action) {
     if (busy) return
     busy = true
-    actionProc.command = [root.scriptPath(), action]
+    actionProc.command = root.cliArgv([action])
     actionProc.running = true
   }
 
   // ---------------- processes (argv arrays only) ----------------
   Process {
     id: statusProc
-    command: [root.scriptPath(), "status"]
+    command: root.cliArgv(["status"])
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -107,14 +134,15 @@ Panel {
     }
   }
 
-  // Fallback only: with no absolute XDG_RUNTIME_DIR there is no state file to
-  // watch, so reconcile against the CLI slowly instead of showing a stale icon.
-  // In every normal session this timer is inert - nothing polls on a schedule.
+  // Fallback only: with no absolute XDG_RUNTIME_DIR - or while the state file has
+  // never loaded, e.g. because the watcher validated a different runtime dir -
+  // there is nothing to watch, so reconcile against the CLI slowly instead of
+  // showing a permanently stale icon. In a normal session this timer is inert.
   Timer {
     id: fallbackRefreshTimer
     interval: 30000
     repeat: true
-    running: root.stateFile === ""
+    running: root.stateFile === "" || !root.stateFileSeen
     onTriggered: root.refresh()
   }
 
@@ -203,30 +231,13 @@ Panel {
   }
 
   // ---------------- focus watcher (auto-close special ws when focus leaves) ----------------
-  // Launched by absolute path with a CLEARED environment and an isolated
-  // interpreter, so this automatic process inherits none of the session
-  // environment and nothing can be resolved through PATH: `/usr/bin/env -i`
-  // drops the inherited environment, only the variables the watcher genuinely
-  // needs are passed back explicitly, and `-I -E -S` keeps PYTHON* variables and
-  // site-packages out of the interpreter as well.
+  // Run through the plugin CLI's internal `watcher` subcommand: the CLI resolves
+  // the interpreter to a validated absolute path (never PATH) and execs it with
+  // -I -E -S, so this process inherits neither the session environment (env -i,
+  // above) nor PYTHON*/site-packages.
   Process {
     id: focusWatcher
-    command: {
-      const watcher = Qt.resolvedUrl("backend/focus_watcher.py").toString().replace(/^file:\/\//, "")
-      const vars = [
-        "HOME=" + (Quickshell.env("HOME") || ""),
-        "PATH=/usr/bin:/bin:/usr/local/bin"
-      ]
-      const runtimeDir = Quickshell.env("XDG_RUNTIME_DIR") || ""
-      const signature = Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") || ""
-      const display = Quickshell.env("WAYLAND_DISPLAY") || ""
-      if (runtimeDir) vars.push("XDG_RUNTIME_DIR=" + runtimeDir)
-      if (signature) vars.push("HYPRLAND_INSTANCE_SIGNATURE=" + signature)
-      if (display) vars.push("WAYLAND_DISPLAY=" + display)
-      return ["/usr/bin/env", "-i"].concat(vars).concat([
-        "/usr/bin/python3", "-I", "-E", "-S", watcher
-      ])
-    }
+    command: root.cliArgv(["watcher"])
     running: true
   }
 

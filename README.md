@@ -147,25 +147,35 @@ your regular foot windows are untouched.
 - Only one dropdown window at a time (by design - it's a Quake dropdown).
 - Wayland-only (Hyprland). X11 is not supported.
 - The bar widget's state is event-driven: the watcher publishes
-  `$XDG_RUNTIME_DIR/dropdown-terminal.state` (0600) whenever the dropdown is
-  shown or hidden, and the widget watches that file. If the runtime directory is
-  unset or not absolute the widget falls back to a slow 30 s reconcile instead.
+  `$XDG_RUNTIME_DIR/dropdown-terminal.state` (0600, written atomically) whenever
+  the dropdown is shown or hidden, and the widget watches that file - no polling.
+  The runtime directory is validated (absolute, owned by you, no group/other bits,
+  ancestors not writable by others, and not `$HOME`); if nothing qualifies, both
+  sides fall back to the systemd path, and if the state file never appears the
+  widget reconciles against the CLI every 30 s instead of showing a stale icon.
 - Dismissal is **click-based**: clicking another window closes the dropdown and
   focuses that window. Clicking *bare desktop background* (no window under the
   cursor) raises no Hyprland event, and clicking the bar does not move keyboard
   focus, so neither closes it - use `SUPER + U` for those.
 - **No `PATH`, minimal environment, bounded output.** The watcher, the backend
   and the CLI resolve every tool they run (`python3`, `bash`, `hyprctl`,
-  `systemctl`, `footclient`, `setsid`, ...) to a validated absolute path from a
-  fixed list of root-owned directories, and refuse to run anything that is
-  group/world-writable or not owned by root; `PATH` is never consulted, so a
-  malicious earlier entry in it cannot be launched by enabling the widget. The
-  watcher is started with a cleared environment (`/usr/bin/env -i`, only the
-  variables it needs) and an isolated interpreter (`-I -E -S`); its children get
-  an environment allowlist and a controlled `PATH`, and captured output is capped
-  (a child that exceeds the cap, or outlives its timeout, is killed as a process
-  group). `omarchy plugin validate .` and the unit tests below cover these
-  guarantees.
+  `systemctl`, `footclient`, `setsid`, `rm`, ...) to a validated absolute path
+  from a fixed list of root-owned directories, and refuse anything owned by
+  another user, group/world-writable, not a regular file, or reached through a
+  directory chain that is not equally trusted; `PATH` is never consulted, so a
+  malicious earlier entry cannot be launched by enabling the widget. The one
+  hard-coded path is `/usr/bin/env`, which runs the watcher with a cleared
+  environment (`-i`, only the variables it needs) and an isolated interpreter
+  (`-I -E -S`) - something must be the first exec, so it stops at a root-owned
+  system path. Children get an environment allowlist plus a `PATH` built only
+  from directories that actually validate, and captured output is capped at
+  256 KiB with the process group killed on overflow or timeout and then reaped.
+- The focus watcher subscribes to Hyprland's event socket instead of polling
+  (idle cost is zero wakeups, versus ~430k `hyprctl` spawns/day when polled at
+  5 Hz). If the socket is missing or stale, it degrades to a 2 s poll and returns
+  to the event path as soon as the socket accepts a connection again - dismissal
+  never depends on the event path working.
+- `omarchy plugin validate .` and the unit tests below cover these guarantees.
 - The plugin sets three global input options in
   `~/.config/hypr/dropdown-terminal.lua`: `special_fallthrough = true`,
   `follow_mouse = 0` and `float_switch_override_focus = 0`. The last two turn
@@ -193,9 +203,9 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # config writes, idempotency, tool resolution
-python3 tests/test_proc.py           # trusted-path resolver, output cap, timeouts
-python3 tests/test_focus_watcher.py  # event state machine, path validation, state file
+python3 tests/test_backend.py        # 23 - config writes, idempotency, unit + tool resolution
+python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
+python3 tests/test_focus_watcher.py  # 30 - event state machine, path validation, state file, socket
 ```
 
 ## License

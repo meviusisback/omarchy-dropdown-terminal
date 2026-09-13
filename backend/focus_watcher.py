@@ -11,7 +11,8 @@ Event-driven, not a poll: it subscribes to Hyprland's event socket
 to `activewindow>>CLASS,TITLE` and `activespecial>>NAME,MONITOR`. The previous
 implementation asked `hyprctl activewindow -j` five times a second - ~432k
 process spawns and compositor round trips a day - to observe something the
-compositor already announces as an event. Idle cost is now zero wakeups.
+compositor already announces as an event. The socket read blocks, so an idle
+watcher is not woken at all.
 
 It also publishes the state the bar widget needs to
 `$XDG_RUNTIME_DIR/dropdown-terminal.state` (0600, written atomically), which
@@ -19,14 +20,17 @@ replaces the widget's old five-second `omarchy-dropdown-terminal status` chain.
 
 Every path and tool it touches is validated first (see backend/proc.py): tools
 come from a fixed root-owned candidate list and never from PATH, children run
-with a minimal environment, captured output is bounded, and the socket and
-runtime directory must be owned by this user (a planted socket must not be able
-to forge focus events). If anything fails validation the watcher exits non-zero
-instead of proceeding; Panel.qml restarts it on a 10 s watchdog.
+with a minimal environment, captured output is bounded, and the runtime
+directory, the socket path and the socket itself must be owned by this user (a
+planted socket must not be able to forge focus events). If anything fails
+validation the watcher exits non-zero instead of proceeding; Panel.qml restarts
+it on a 10 s watchdog.
 
-Started by Panel.qml. An exclusive, `O_NOFOLLOW` 0600 flock keeps a stale
-instance from racing a fresh one - the hide path toggles, so two watchers
-reacting to the same focus change could re-open what the first one closed.
+Started by Panel.qml through the plugin CLI (`omarchy-dropdown-terminal watcher`),
+which resolves the interpreter itself. An exclusive, `O_NOFOLLOW` 0600 flock
+keeps a stale instance from racing a fresh one - the hide path toggles, so two
+watchers reacting to the same focus change could re-open what the first one
+closed.
 """
 
 import fcntl
@@ -48,6 +52,7 @@ APP_ID = "org.omarchy.dropdown-terminal"
 SPECIAL_WS = "special:dropdown"
 STARTUP_GRACE = 0.5      # let a shell reload settle before acting
 POLL_INTERVAL = 2.0      # degraded mode only, when there is no event socket
+POLL_RECHECK_TICKS = 15  # degraded mode: look for the event socket again (~30 s)
 MAX_LINE = 4096          # bytes; longer event lines are dropped, not buffered
 MAX_BUFFER = 65536       # bytes of unterminated event data we will hold
 HIDE_TIMEOUT = 8.0
@@ -117,43 +122,96 @@ class Watcher:
 # ------------------------------------------------------------ validated paths
 
 
-def runtime_dir():
-    """The runtime directory, or None when nothing safe is available.
+def _uid_owned_dir(path):
+    """A directory this user owns with no group/other access."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != os.getuid():
+        return False
+    return not st.st_mode & 0o077
 
-    Only an absolute, existing directory owned by this user and inaccessible to
-    group/others is accepted, so a spoofed XDG_RUNTIME_DIR cannot redirect the
-    state file or the socket path outside the session runtime directory.
+
+def _ancestors_safe(path, ancestor_uids=None):
+    """Every directory above `path`: owned by a trusted uid, unwritable by others.
+
+    A directory whose name another user can replace (a world-writable parent) makes
+    the validated leaf meaningless. `ancestor_uids` defaults to root plus this user
+    and is parameterised only so the tests can run in the dev sandbox, where
+    root-owned paths read as uid 65534 (uid 0 is not mapped into the user namespace).
     """
+    trusted = (0, os.getuid()) if ancestor_uids is None else tuple(ancestor_uids)
+    current = os.path.dirname(os.path.realpath(path))
+    while True:
+        try:
+            st = os.stat(current)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if st.st_uid not in trusted:
+            return False
+        if st.st_mode & 0o022:
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return True
+        current = parent
+
+
+def runtime_dir(ancestor_uids=None):
+    """The session runtime directory, or None when nothing acceptable exists.
+
+    Enforced exactly: an absolute, existing directory owned by this user with no
+    group/other bits, every ancestor owned by root or this user and not
+    group/world-writable, and not HOME (nor an ancestor of HOME). So a spoofed
+    XDG_RUNTIME_DIR cannot redirect the state file, the lock or the socket path
+    into a directory whose name someone else could swap - and the systemd
+    per-user path is accepted as the fallback because it satisfies the same rules.
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
     for candidate in (os.environ.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}"):
         if not candidate or not os.path.isabs(candidate):
             continue
-        try:
-            st = os.stat(candidate)
-        except OSError:
+        real = os.path.realpath(candidate)
+        if home == real or home.startswith(real + os.sep):
+            continue  # HOME (or an ancestor of it) is not a runtime directory
+        if not _uid_owned_dir(real):
             continue
-        if not stat.S_ISDIR(st.st_mode):
+        if not _ancestors_safe(real, ancestor_uids):
             continue
-        if st.st_uid != os.getuid():
-            continue
-        if st.st_mode & 0o077:
-            continue
-        return candidate
+        return real
     return None
 
 
 def socket_path(rt):
-    """The Hyprland event socket, or None if it cannot be trusted.
+    """The Hyprland event socket, or None when it cannot be trusted.
 
-    The instance signature comes from the environment, so it is validated
-    against a strict charset before being joined into a path (a `..` in it
-    would otherwise walk out of the runtime directory), and the socket itself
+    The instance signature comes from the environment, so it is validated against
+    a strict charset before being joined into a path (a `..` in it would otherwise
+    walk out of the runtime directory); neither the `hypr` directory nor the
+    signature directory may be a symlink (lstat, not stat); and the socket itself
     must be a socket owned by this user - a planted socket could forge
     activewindow events and drive the hide path.
     """
     signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or ""
     if not SIGNATURE_RE.match(signature):
         return None
-    path = os.path.join(rt, "hypr", signature, ".socket2.sock")
+    hypr = os.path.join(rt, "hypr")
+    signature_dir = os.path.join(hypr, signature)
+    for directory in (hypr, signature_dir):
+        try:
+            st = os.lstat(directory)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):  # lstat: a symlink does not pass
+            return None
+        if st.st_uid not in (0, os.getuid()):
+            return None
+    path = os.path.join(signature_dir, ".socket2.sock")
     try:
         st = os.stat(path)
     except OSError:
@@ -161,6 +219,25 @@ def socket_path(rt):
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
         return None
     return path
+
+
+def can_connect(path, timeout=1.0):
+    """True when the event socket actually accepts a connection right now.
+
+    The socket FILE existing is not enough: a stale socket left behind by a
+    restarted compositor keeps os.stat() happy but refuses connections, and
+    retrying forever would silently stop hiding the dropdown. Used to decide
+    between the event path and the polling fallback.
+    """
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(timeout)
+        connection.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        connection.close()
 
 
 def write_state(path, visible):
@@ -173,8 +250,9 @@ def write_state(path, visible):
         log(f"cannot create state file in {directory}: {exc}")
         return False
     try:
-        os.fchmod(fd, 0o600)
+        # fdopen immediately takes ownership of the fd, so no error path can leak it
         with os.fdopen(fd, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(payload)
         os.replace(tmp, path)
         return True
@@ -190,14 +268,19 @@ def write_state(path, visible):
 # ------------------------------------------------------------------ actions
 
 
+def run_tool(argv, timeout=3.0):
+    """proc.run with every failure folded into a failed Result (never raises)."""
+    try:
+        return proc.run(argv, timeout=timeout)
+    except (ValueError, OSError, proc.ToolNotFound) as exc:
+        log(f"cannot run {argv[0]}: {exc}")
+        return proc.Result(1, "", str(exc))
+
+
 def hide_dropdown():
     """Hide through the plugin CLI, which owns the guarded Lua dispatch."""
     for attempt in (1, 2):
-        try:
-            result = proc.run([CLI, "close"], timeout=HIDE_TIMEOUT)
-        except (ValueError, OSError, proc.ToolNotFound) as exc:
-            log(f"cannot run the plugin CLI: {exc}")
-            return False
+        result = run_tool([CLI, "close"], timeout=HIDE_TIMEOUT)
         if result.returncode == 0:
             return True
         log(f"close attempt {attempt} failed (rc={result.returncode})")
@@ -206,7 +289,7 @@ def hide_dropdown():
 
 
 def is_visible(hyprctl):
-    result = proc.run([hyprctl, "monitors", "-j"], timeout=3)
+    result = run_tool([hyprctl, "monitors", "-j"])
     if result.returncode != 0:
         return False
     try:
@@ -220,7 +303,7 @@ def is_visible(hyprctl):
 
 
 def active_class(hyprctl):
-    result = proc.run([hyprctl, "activewindow", "-j"], timeout=3)
+    result = run_tool([hyprctl, "activewindow", "-j"])
     if result.returncode != 0:
         return ""
     try:
@@ -240,21 +323,29 @@ def handle(watcher, state_path, action):
         hide_dropdown()
 
 
-def event_loop(watcher, state_path, path, hyprctl):
-    """Read Hyprland events until the socket dies; reconnect with backoff."""
+def event_loop(watcher, state_path, hyprctl, rt):
+    """Subscribe to the event socket until it can no longer be used."""
     backoff = 0.5
+    failures = 0
     while True:
+        path = socket_path(rt)  # re-validated right before connecting
+        if path is None:
+            log("no trusted event socket available; leaving the event path")
+            return
         try:
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            connection.settimeout(1.0)
-            connection.connect(path)
+            connection.connect(path)  # blocking: an idle watcher is never woken
         except OSError as exc:
-            log(f"event socket unusable ({exc}); retrying in {backoff:.1f}s")
+            failures += 1
+            log(f"event socket connect failed ({exc}); attempt {failures}")
+            if failures >= 3:
+                # A socket file that exists but never accepts (stale socket from a
+                # restarted compositor) must not disable dismissal: fall back to
+                # polling, which retries the event path periodically.
+                log("event socket unusable; falling back to polling")
+                return
             time.sleep(backoff)
-            backoff = min(backoff * 2, 10.0)
-            if backoff >= 10.0 and socket_path(runtime_dir() or "") is None:
-                log("no event socket found; falling back to polling")
-                return poll_loop(watcher, state_path, hyprctl)
+            backoff = min(backoff * 2, 5.0)
             continue
         backoff = 0.5
         log("subscribed to the Hyprland event socket")
@@ -263,8 +354,6 @@ def event_loop(watcher, state_path, path, hyprctl):
             while True:
                 try:
                     chunk = connection.recv(8192)
-                except socket.timeout:
-                    continue
                 except OSError as exc:
                     log(f"event socket read failed: {exc}")
                     break
@@ -287,16 +376,24 @@ def event_loop(watcher, state_path, path, hyprctl):
         time.sleep(0.5)
 
 
-def poll_loop(watcher, state_path, hyprctl):
+def poll_loop(watcher, state_path, hyprctl, rt):
     """Degraded mode for an engine without the event socket.
 
     Slower (2 s, not 5 Hz) and reaped per call, but it keeps click-to-dismiss
-    working. Visibility is still authoritative from the compositor.
+    working, and it returns to the event path if the socket appears later.
     """
     log("polling the compositor every 2s (degraded mode)")
+    ticks = 0
     while True:
-        handle(watcher, state_path, watcher.feed(f"activespecial>>{SPECIAL_WS if is_visible(hyprctl) else ''},-"))
+        visible = is_visible(hyprctl)
+        handle(watcher, state_path, watcher.feed(f"activespecial>>{SPECIAL_WS if visible else ''},-"))
         handle(watcher, state_path, watcher.feed(f"activewindow>>{active_class(hyprctl)},"))
+        ticks += 1
+        if ticks % POLL_RECHECK_TICKS == 0:
+            path = socket_path(rt)
+            if path is not None and can_connect(path):
+                log("event socket is usable again; returning to the event path")
+                return
         time.sleep(POLL_INTERVAL)
 
 
@@ -319,7 +416,7 @@ def acquire_lock(rt):
 def main():
     rt = runtime_dir()
     if rt is None:
-        log("no safe runtime directory (need an absolute, uid-owned, 0700 dir)")
+        log("no acceptable runtime directory (absolute, uid-owned, 0700, safe ancestors)")
         return 2
 
     # Single instance, fail closed: a second watcher reacting to the same focus
@@ -347,10 +444,14 @@ def main():
 
     time.sleep(STARTUP_GRACE)
 
-    path = socket_path(rt)
-    if path is None:
-        return poll_loop(watcher, state_path, hyprctl)
-    return event_loop(watcher, state_path, path, hyprctl)
+    while True:
+        # Route on whether the socket can actually be subscribed to, not merely on
+        # whether it exists: a stale socket file must degrade to polling.
+        path = socket_path(rt)
+        if path is not None and can_connect(path):
+            event_loop(watcher, state_path, hyprctl, rt)
+        else:
+            poll_loop(watcher, state_path, hyprctl, rt)
 
 
 if __name__ == "__main__":

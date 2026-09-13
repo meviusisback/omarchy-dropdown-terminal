@@ -19,9 +19,11 @@ Design guarantees:
     and runs with a minimal environment and bounded output - see proc.py.
 """
 
+import contextlib
 import fcntl
 import json
 import os
+import pwd
 import stat as stat_module
 import sys
 import tempfile
@@ -30,7 +32,35 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import proc  # noqa: E402  (sibling module: trusted plugin code)
 
-HOME = os.path.expanduser("~")
+
+def _validated_home():
+    """The user's home directory, or a loud failure.
+
+    Every path this backend writes derives from HOME, so an empty or relative
+    value would scatter config into the filesystem root or the current directory.
+    Accept only an absolute, existing directory owned by this user; otherwise fall
+    back to the passwd entry, and refuse to guess.
+    """
+    candidates = [os.environ.get("HOME", "")]
+    try:
+        candidates.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:  # pragma: no cover - uid without a passwd entry
+        pass
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            st = os.stat(candidate)
+        except OSError:
+            continue
+        if stat_module.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+            return candidate.rstrip("/") or "/"
+    raise SystemExit(
+        "cannot determine a safe HOME (unset, relative, missing, or not owned by this user)"
+    )
+
+
+HOME = _validated_home()
 MARKER = "meviusisback.dropdown-terminal"
 
 HYPRLAND_DIR = os.path.join(HOME, ".config", "hypr")
@@ -53,7 +83,14 @@ RULES_END = f"-- END {MARKER}"
 UNIT_BEGIN = f"# BEGIN {MARKER} (foot server unit)"
 UNIT_END = f"# END {MARKER}"
 
-UNIT_BODY = f"""\
+def unit_body(foot):
+    """The systemd unit, with the RESOLVED foot path substituted in.
+
+    The binary the unit actually executes must be the one that was validated, not
+    a hardcoded path that might resolve elsewhere (proc.resolve could legitimately
+    have chosen /usr/local/bin/foot).
+    """
+    return f"""\
 {UNIT_BEGIN}
 [Unit]
 Description=Foot terminal server (drop-down terminal, instance %i)
@@ -62,7 +99,7 @@ After=graphical-session.target
 ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
-ExecStart=/usr/bin/foot --server=%t/foot-%i.sock --app-id={DROPDOWN_APP_ID}
+ExecStart={foot} --server=%t/foot-%i.sock --app-id={DROPDOWN_APP_ID}
 Restart=on-failure
 NonBlocking=true
 UnsetEnvironment=LISTEN_PID LISTEN_FDS LISTEN_FDNAMES
@@ -156,8 +193,8 @@ BIND_TAG = "Toggle drop-down terminal"
 # ----------------------------------------------------------------- utilities
 
 
-# Every _call() argv recorded while DDT_TEST=1, so the test suite can assert on
-# the exact tool paths without touching systemd or the developer's compositor.
+# Every _call() argv, recorded so the test suite can assert that no call site
+# passes a bare tool name; the suite substitutes proc.run so nothing is executed.
 CALLS = []
 
 
@@ -186,17 +223,15 @@ def _call(name, *args, timeout=10):
 
     `name` is resolved to a validated absolute path (never through PATH); a tool
     that cannot be resolved fails safely rather than being looked up by the OS.
-    Under DDT_TEST the call is recorded and skipped, which keeps the test suite
-    hermetic - no systemd or compositor side effects from a test run.
+    The argv is appended to CALLS for the test suite, which substitutes proc.run
+    so that a test run never executes systemctl against the developer's session.
     """
     try:
         binary = _tool(name)
     except RuntimeError as exc:
         return _Failed(str(exc))
     argv = [binary, *args]
-    if os.environ.get("DDT_TEST") == "1":
-        CALLS.append(argv)
-        return proc.Result(0, "", "")
+    CALLS.append(argv)
     try:
         return proc.run(argv, timeout=timeout)
     except (ValueError, OSError, proc.ToolNotFound) as exc:
@@ -211,20 +246,28 @@ def _run(argv, timeout=10):
         return _Failed(str(exc))
 
 
-def _locked(path, mode="a+"):
-    """Open an exclusive lockfile context manager (flock)."""
-    class _Lock:
-        def __enter__(self):
-            self.fd = open(path, mode)
-            fcntl.flock(self.fd, fcntl.LOCK_EX)
-            return self.fd
+@contextlib.contextmanager
+def _locked(path):
+    """Serialise config edits behind an exclusive flock'd lockfile.
 
-        def __exit__(self, *exc):
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            self.fd.close()
-            return False
-
-    return _Lock()
+    Created 0600 with O_NOFOLLOW (a symlink planted at the lock path would
+    otherwise let the plugin open and lock an arbitrary file the user owns) and
+    O_CLOEXEC so no spawned child inherits the descriptor.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"cannot open the lock file {path}: {exc}") from exc
+    handle = os.fdopen(fd, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def atomic_write(path, content, mode=0o644):
@@ -314,8 +357,12 @@ def check_keybind_conflict():
     return None
 
 
-def install_unit():
+def install_unit(foot=None):
     """Install the foot-server@ template unit, backing up a foreign file."""
+    if foot is None:
+        foot = proc.resolve("foot")
+    if foot is None:
+        raise SystemExit("cannot install the foot server unit: no trusted foot binary")
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
     existing = read_text(UNIT_DST_PATH)
     if existing is not None and MARKER not in existing:
@@ -324,7 +371,7 @@ def install_unit():
             with open(UNIT_DST_PATH, "rb") as src, open(backup, "wb") as dst:
                 dst.write(src.read())
             print(f"backed up existing {UNIT_DST_PATH} -> {backup}")
-    atomic_write(UNIT_DST_PATH, UNIT_BODY)
+    atomic_write(UNIT_DST_PATH, unit_body(foot))
     _call("systemctl", "--user", "daemon-reload")
     return True
 
@@ -343,10 +390,7 @@ def install(quiet=False):
     #    unsupported layout must fail loudly, not leave a half-installed plugin.
     tools = {name: proc.resolve(name) for name in ("python3", "bash", "foot")}
     missing = sorted(name for name, path in tools.items() if path is None)
-    # Under DDT_TEST the suite runs unprivileged (and, in the dev sandbox, in a
-    # user namespace where root-owned files read as nobody), so the hard failure
-    # is skipped there; the live install exercises it for real.
-    if missing and os.environ.get("DDT_TEST") != "1":
+    if missing:
         raise SystemExit(
             "missing trusted tools: "
             + ", ".join(missing)
@@ -354,7 +398,6 @@ def install(quiet=False):
             " not group/world-writable)"
         )
     results["tools"] = tools
-    results["tools_missing"] = missing
 
     # 1. Hyprland rules file (always regenerated, marker-checked).
     atomic_write(RULES_PATH, RULES_BODY)
@@ -384,10 +427,9 @@ def install(quiet=False):
         added = append_block(BINDINGS_LUA, BIND_BEGIN, BIND_BODY, BIND_END)
         results["keybind"] = "added" if added else "already-installed"
 
-    # 4. systemd unit + enable (enable skipped under DDT_TEST: hermetic tests).
-    install_unit()
-    if os.environ.get("DDT_TEST") != "1":
-        enable_server()
+    # 4. systemd unit (with the validated foot path) + enable.
+    install_unit(tools["foot"])
+    enable_server()
     results["unit"] = UNIT_REF
 
     if not quiet:
@@ -426,10 +468,9 @@ def uninstall():
         results["unit_file"] = "absent"
     _call("systemctl", "--user", "daemon-reload")
 
-    try:
-        os.unlink(LOCK_PATH)
-    except FileNotFoundError:
-        pass
+    # The lock file is deliberately NOT removed: unlinking a lock another process
+    # may still hold would let a fresh process create a different inode and both
+    # proceed, which is the split-brain the lock exists to prevent.
 
     print(json.dumps(results, indent=2))
     return results

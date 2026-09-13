@@ -91,23 +91,55 @@ class StateMachineTest(unittest.TestCase):
 
 
 class RuntimeDirTest(unittest.TestCase):
+    """runtime_dir() validation.
+
+    `sandbox_uids` is injected because this suite also runs inside a bubblewrap
+    user namespace where root-owned paths read as uid 65534 (uid 0 unmapped), so the
+    ancestor walk would reject every real directory there. Production passes nothing
+    and therefore trusts only root and the current user.
+    """
+
+    SANDBOX_UIDS = (0, os.getuid(), os.stat("/").st_uid)
+
     def test_accepts_the_valid_session_dir(self):
         with _env("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"):
-            self.assertEqual(watcher_mod.runtime_dir(), f"/run/user/{os.getuid()}")
+            self.assertEqual(
+                watcher_mod.runtime_dir(self.SANDBOX_UIDS), f"/run/user/{os.getuid()}"
+            )
 
-    def test_rejects_relative_and_world_writable_values(self):
-        for bad in ("tmp", "/tmp", ""):
+    def test_rejects_relative_world_writable_and_root_paths(self):
+        for bad in ("tmp", "/tmp", "", "/etc", "/usr"):
             with _env("XDG_RUNTIME_DIR", bad):
                 # falls back to the real per-user dir, which is 0700 and ours
                 self.assertEqual(
-                    watcher_mod.runtime_dir(), f"/run/user/{os.getuid()}"
+                    watcher_mod.runtime_dir(self.SANDBOX_UIDS), f"/run/user/{os.getuid()}"
                 )
 
-    def test_returns_none_when_nothing_is_safe(self):
+    def test_rejects_a_private_dir_inside_a_world_writable_parent(self):
+        # A 0700 directory whose name sits in a world-writable parent can be
+        # replaced: the leaf check alone is not enough, so this must be refused.
+        parent = tempfile.mkdtemp(prefix="ddt-parent-")
+        os.chmod(parent, 0o777)
+        child = os.path.join(parent, "rt")
+        os.mkdir(child, 0o700)
+        with _env("XDG_RUNTIME_DIR", child):
+            self.assertEqual(
+                watcher_mod.runtime_dir(self.SANDBOX_UIDS), f"/run/user/{os.getuid()}"
+            )
+
+    def test_rejects_home_and_its_ancestors(self):
+        home = os.path.expanduser("~")
+        for bad in (home, os.path.dirname(home), "/"):
+            with _env("XDG_RUNTIME_DIR", bad):
+                self.assertEqual(
+                    watcher_mod.runtime_dir(self.SANDBOX_UIDS), f"/run/user/{os.getuid()}"
+                )
+
+    def test_returns_none_when_nothing_is_acceptable(self):
         with _env("XDG_RUNTIME_DIR", "/etc"):
-            # /etc is root-owned, so it fails the ownership test; the fallback
-            # /run/user/<uid> is still valid in this environment.
-            self.assertIn(watcher_mod.runtime_dir(), (None, f"/run/user/{os.getuid()}"))
+            # /etc is root-owned but not ours, and the fallback is still valid here;
+            # with a stricter uid set (root only) even the fallback must be refused.
+            self.assertIsNone(watcher_mod.runtime_dir((0,)))
 
 
 class SocketPathTest(unittest.TestCase):
@@ -149,6 +181,61 @@ class SocketPathTest(unittest.TestCase):
     def test_rejects_missing_socket(self):
         with _env("HYPRLAND_INSTANCE_SIGNATURE", self.signature):
             self.assertIsNone(watcher_mod.socket_path(self.runtime))
+
+    def test_accepts_a_live_listening_socket(self):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(os.path.join(self.runtime, "live.sock"))
+        listener.listen(1)
+        self.assertTrue(watcher_mod.can_connect(os.path.join(self.runtime, "live.sock")))
+
+    def test_rejects_a_stale_socket_file_with_no_listener(self):
+        # A socket left behind by a restarted compositor: stat() is happy, but
+        # nothing accepts, so the watcher must not keep retrying the event path.
+        stale = os.path.join(self.runtime, "stale.sock")
+        temp = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        temp.bind(stale)
+        temp.close()
+        self.assertFalse(watcher_mod.can_connect(stale, timeout=0.2))
+
+    def test_rejects_symlinked_signature_directory(self):
+        # A symlinked component would let the subscription be redirected.
+        elsewhere = tempfile.mkdtemp(prefix="ddt-elsewhere-")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(os.path.join(elsewhere, ".socket2.sock"))
+        self.addCleanup(sock.close)
+        os.makedirs(os.path.join(self.runtime, "hypr"), exist_ok=True)
+        os.symlink(elsewhere, os.path.join(self.runtime, "hypr", self.signature))
+        with _env("HYPRLAND_INSTANCE_SIGNATURE", self.signature):
+            self.assertIsNone(watcher_mod.socket_path(self.runtime))
+
+
+class ToolCallGuardTest(unittest.TestCase):
+    def test_is_visible_and_active_class_never_raise(self):
+        # A failing proc.run (bad tool path, spawn error) must degrade to "no
+        # information" rather than propagating out of the watcher loop.
+        def boom(*args, **kwargs):
+            raise ValueError("bad argv")
+
+        original = watcher_mod.proc.run
+        watcher_mod.proc.run = boom
+        try:
+            self.assertFalse(watcher_mod.is_visible("/usr/bin/hyprctl"))
+            self.assertEqual(watcher_mod.active_class("/usr/bin/hyprctl"), "")
+        finally:
+            watcher_mod.proc.run = original
+
+    def test_run_tool_folds_tool_not_found(self):
+        def missing(*args, **kwargs):
+            raise watcher_mod.proc.ToolNotFound("nope")
+
+        original = watcher_mod.proc.run
+        watcher_mod.proc.run = missing
+        try:
+            result = watcher_mod.run_tool(["/usr/bin/hyprctl", "monitors", "-j"], timeout=1)
+            self.assertNotEqual(result.returncode, 0)
+        finally:
+            watcher_mod.proc.run = original
 
 
 class StateFileTest(unittest.TestCase):

@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Tests for the dropdown-terminal backend: idempotency, atomicity, uninstall.
 
-Runs against a sandboxed HOME (never touches the real user config):
-HOME is repointed before the backend module is imported.
+Hermetic by construction: HOME is repointed at a temp directory before the module
+is imported, and proc.run / proc.resolve are substituted in setUp, so a test run
+never executes systemctl against the developer's user manager and never depends on
+the environment's real tool ownership.
 """
 
 import importlib
@@ -14,7 +16,6 @@ import unittest
 
 SANDBOX = tempfile.mkdtemp(prefix="ddt-test-")
 os.environ["HOME"] = SANDBOX
-os.environ["DDT_TEST"] = "1"
 BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 sys.path.insert(0, BACKEND_DIR)
 
@@ -27,6 +28,27 @@ class BackendTest(unittest.TestCase):
                   backend.UNIT_DST_PATH, backend.UNIT_DST_PATH + ".pre-dropdown-terminal.bak"):
             if os.path.exists(p):
                 os.unlink(p)
+
+        # Hermetic substitution: tools "resolve" without touching the filesystem's
+        # real ownership, and proc.run is replaced by a synthetic success so no test
+        # can start systemctl against this machine's user manager. _call() itself
+        # records every argv in backend.CALLS.
+        self._real_run = backend.proc.run
+        self._real_resolve = backend.proc.resolve
+        backend.CALLS.clear()
+        backend.proc.resolve = lambda name, *args, **kwargs: f"/usr/bin/{name}"
+        backend.proc.run = self._fake_run
+
+        def restore():
+            backend.proc.run = self._real_run
+            backend.proc.resolve = self._real_resolve
+
+        self.addCleanup(restore)
+
+    @staticmethod
+    def _fake_run(argv, timeout=None, limit=None, env=None, cwd=None):
+        """Stand-in for proc.run: reports success without starting anything."""
+        return backend.proc.Result(0, "", "")
 
     def test_rules_body_has_markers(self):
         self.assertIn(backend.RULES_BEGIN, backend.RULES_BODY)
@@ -146,18 +168,11 @@ class BackendTest(unittest.TestCase):
 
     def test_every_external_call_uses_an_absolute_trusted_path(self):
         # The plugin is started automatically once the widget is enabled, so no
-        # call site may leave a tool to be found through PATH. _call() resolves
-        # names through proc.resolve(); stub that here (the dev sandbox cannot
-        # see root-owned files) and assert every recorded argv[0] is absolute and
-        # comes from a trusted candidate directory.
-        original = backend.proc.resolve
-        backend.proc.resolve = lambda name, *a, **k: f"/usr/bin/{name}"
-        backend.CALLS.clear()
-        try:
-            backend.install(quiet=True)
-            backend.uninstall()
-        finally:
-            backend.proc.resolve = original
+        # call site may leave a tool to be found through PATH. setUp() substitutes
+        # proc.resolve with a stub (the dev sandbox cannot see root-owned files) and
+        # _call() records every argv it builds.
+        backend.install(quiet=True)
+        backend.uninstall()
         self.assertTrue(backend.CALLS, "expected the install path to call systemctl")
         for argv in backend.CALLS:
             self.assertTrue(os.path.isabs(argv[0]), argv)
@@ -166,6 +181,15 @@ class BackendTest(unittest.TestCase):
                     for directory in backend.proc.CANDIDATE_DIRS),
                 f"{argv[0]} does not come from a trusted candidate directory",
             )
+
+    def test_installed_unit_uses_the_resolved_foot_path(self):
+        # ExecStart must be the binary that was validated, not a hardcoded path.
+        backend.proc.resolve = lambda name, *args, **kwargs: f"/opt/verified/{name}"
+        backend.install(quiet=True)
+        with open(backend.UNIT_DST_PATH) as handle:
+            unit = handle.read()
+        self.assertIn("ExecStart=/opt/verified/foot --server=%t/foot-%i.sock", unit)
+        self.assertNotIn("ExecStart=/usr/bin/foot", unit)
 
     def test_no_call_site_passes_a_bare_tool_name(self):
         # A bare name in an argv array is resolved through PATH by the OS, which
@@ -178,17 +202,20 @@ class BackendTest(unittest.TestCase):
         self.assertNotIn("subprocess.", source)
 
     def test_install_fails_loudly_without_trusted_tools(self):
-        original = backend.proc.resolve
-        ddt = os.environ.pop("DDT_TEST", None)
         backend.proc.resolve = lambda *args, **kwargs: None
-        try:
-            with self.assertRaises(SystemExit) as caught:
-                backend.install(quiet=True)
-            self.assertIn("missing trusted tools", str(caught.exception))
-        finally:
-            backend.proc.resolve = original
-            if ddt is not None:
-                os.environ["DDT_TEST"] = ddt
+        with self.assertRaises(SystemExit) as caught:
+            backend.install(quiet=True)
+        self.assertIn("missing trusted tools", str(caught.exception))
+
+    def test_backend_has_no_environment_switched_test_mode(self):
+        # A test seam that switches off real behaviour via an environment variable
+        # is environment-trusted: a stray DDT_TEST=1 would make install/uninstall
+        # report success while doing nothing. The suite substitutes proc.run
+        # instead, so the library must not consult such a flag.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "backend", "dropdown_terminal.py")) as handle:
+            source = handle.read()
+        self.assertNotIn("DDT_TEST", source)
 
     def test_plugin_scripts_pin_absolute_interpreters(self):
         # A `#!/usr/bin/env …` shebang is a PATH lookup performed by the kernel,
@@ -200,21 +227,54 @@ class BackendTest(unittest.TestCase):
                 first = handle.readline().strip()
             self.assertRegex(first, r"^#!/usr/bin/(python3|bash)$", rel)
 
-    def test_panel_launches_the_watcher_without_path_or_inherited_env(self):
+    def test_panel_launches_every_automatic_process_through_the_cli(self):
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         with open(os.path.join(repo, "Panel.qml")) as handle:
             panel = handle.read()
+        # No bare interpreter: the watcher runs through the CLI's own subcommand,
+        # which resolves the interpreter itself.
         self.assertNotIn('["python3"', panel)
+        self.assertIn('root.cliArgv(["watcher"])', panel)
+        self.assertIn('root.cliArgv(["status"])', panel)
+        # Every automatic process clears the environment first.
         self.assertIn('"/usr/bin/env"', panel)
         self.assertIn('"-i"', panel)
-        self.assertIn('"/usr/bin/python3"', panel)
-        self.assertIn('"-I"', panel)
-        self.assertIn('"-E"', panel)
-        self.assertIn('"-S"', panel)
+        self.assertIn('"PATH=/usr/bin:/bin:/usr/local/bin"', panel)
+        # The isolated-interpreter flags live where the interpreter is resolved.
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        self.assertIn('exec "$PYTHON" -I -E -S', cli)
+
+    def test_cli_resolves_every_tool_its_commands_use(self):
+        # Regression: `close` calls pull_window_into_special -> unpin_if_pinned,
+        # which uses $SLEEP; under `set -u` an unresolved variable aborts the whole
+        # command before the hide, so every reachable tool must be listed.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        self.assertIn('close)       wanted="hyprctl python3 sleep"', cli)
+        self.assertIn('uninstall)   wanted="hyprctl python3 systemctl rm"', cli)
+        # and the variables those lists resolve are the ones actually used
+        self.assertIn('"$SLEEP" 0.2', cli)
+        self.assertIn('"$RM" -f "$LOCAL_BIN"', cli)
+
+    def test_cli_need_guards_match_the_python_resolver(self):
+        # The bash twin must reject what resolve() rejects: `.`/`..`, directories,
+        # and symlinks whose target lives in an untrusted directory.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        self.assertIn('""|"."|"..") die "invalid tool name', cli)
+        self.assertIn("*..*) die \"invalid tool name", cli)
+        self.assertIn('[ -f "$real" ]', cli)          # regular file only
+        self.assertIn('dir_trusted "${real%/*}"', cli)  # resolved path's directory
+        self.assertIn("READLINK_BIN", cli)
 
     def test_cli_never_invokes_a_tool_by_bare_name(self):
-        # The CLI may run with no PATH at all (the watcher spawns it with a
-        # minimal environment), so every tool must go through need()/$VARS.
+        # The CLI runs with no PATH at all (it is started with a cleared
+        # environment), so every tool must go through need()/$VARS. The regex must
+        # catch indented command positions too - a bare `rm` slipped through a
+        # line-start-only pattern once already.
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         path = os.path.join(repo, "bin", "omarchy-dropdown-terminal")
         with open(path) as handle:
@@ -223,8 +283,8 @@ class BackendTest(unittest.TestCase):
         self.assertNotIn("command -v", source)
         self.assertNotIn("/usr/bin/env", source)
         bare = re.compile(
-            r"(?:^|[;&|(`]\s*)(python3|hyprctl|systemctl|sleep|setsid|footclient"
-            r"|mkdir|ln|stat|readlink|id)\s"
+            r"(?:^|[;&|(`])\s*(python3|hyprctl|systemctl|sleep|setsid|footclient"
+            r"|mkdir|ln|rm|stat|readlink|id|dirname)\s"
         )
         for number, line in enumerate(lines, 1):
             if line.strip().startswith("#"):

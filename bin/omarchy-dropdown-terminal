@@ -28,9 +28,13 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 STAT_BIN=/usr/bin/stat
 [ -x "$STAT_BIN" ] || STAT_BIN=/bin/stat
 [ -x "$STAT_BIN" ] || { printf 'Error: no usable stat binary\n' >&2; exit 1; }
+READLINK_BIN=/usr/bin/readlink
+[ -x "$READLINK_BIN" ] || READLINK_BIN=/bin/readlink
+[ -x "$READLINK_BIN" ] || { printf 'Error: no usable readlink binary\n' >&2; exit 1; }
 
 # 0 when $1 is a root-owned directory that group/others cannot write, walking up
 # to / — an attacker-writable directory in the chain would void the check.
+# (Called with the RESOLVED path's directory, never the literal one.)
 dir_trusted() {
   local d="$1" st uid mode
   while :; do
@@ -44,35 +48,46 @@ dir_trusted() {
 }
 
 # Print the trusted absolute path of a tool, or die. Never consults PATH.
+# Mirrors backend/proc.py resolve(): the symlink is resolved first, the RESOLVED
+# target must be a regular file we did not have to trust a writable directory for,
+# and the resolved path is what gets returned and executed.
 need() {
-  local name="$1" dir cand st uid mode
+  local name="$1" dir cand real st uid mode
   case "$name" in
-    ""|*[!A-Za-z0-9._+-]*) die "invalid tool name: $name" ;;
+    ""|"."|"..") die "invalid tool name: $name" ;;
+    *[!A-Za-z0-9._+-]*) die "invalid tool name: $name" ;;
+    *..*) die "invalid tool name: $name" ;;
   esac
   for dir in /usr/bin /bin /usr/local/bin; do
     cand="$dir/$name"
     [ -x "$cand" ] || continue
-    st="$("$STAT_BIN" -L -c '%u %a' -- "$cand" 2>/dev/null)" || continue
+    real="$("$READLINK_BIN" -f -- "$cand" 2>/dev/null)" || continue
+    [ -n "$real" ] && [ -f "$real" ] || continue          # regular file only
+    st="$("$STAT_BIN" -L -c '%u %a' -- "$real" 2>/dev/null)" || continue
     uid="${st%% *}"; mode="${st##* }"
     [ "$uid" = "0" ] || continue
     (( 8#$mode & 8#022 )) && continue
-    dir_trusted "$dir" || continue
-    printf '%s' "$cand"
+    dir_trusted "${real%/*}" || continue
+    printf '%s' "$real"
     return 0
   done
-  die "no trusted $name found (looked in /usr/bin, /bin, /usr/local/bin; must be root-owned and not group/world-writable)"
+  die "no trusted $name found (looked in /usr/bin, /bin, /usr/local/bin; must be a root-owned regular executable)"
 }
 
-# Resolve exactly what the requested command needs, once per process.
+# Resolve exactly what the requested command needs, once per process. Every
+# function reachable from a command must have its tools listed here: under
+# `set -u` a missing variable aborts the command (that is how a missing $SLEEP
+# in the close path was caught).
 resolve_tools() {
   local wanted name
   case "$1" in
     toggle|open) wanted="hyprctl python3 systemctl sleep setsid footclient" ;;
-    close)       wanted="hyprctl python3" ;;
+    close)       wanted="hyprctl python3 sleep" ;;
     kill)        wanted="systemctl" ;;
-    status)      wanted="systemctl hyprctl python3" ;;
+    status)      wanted="python3" ;;
     install)     wanted="foot hyprctl python3 systemctl mkdir ln" ;;
-    uninstall)   wanted="hyprctl python3 systemctl" ;;
+    uninstall)   wanted="hyprctl python3 systemctl rm" ;;
+    watcher)     wanted="python3" ;;
     *)           wanted="" ;;
   esac
   for name in $wanted; do
@@ -86,6 +101,7 @@ resolve_tools() {
       foot)       FOOT="$(need foot)" ;;
       mkdir)      MKDIR="$(need mkdir)" ;;
       ln)         LN="$(need ln)" ;;
+      rm)         RM="$(need rm)" ;;
     esac
   done
 }
@@ -110,8 +126,12 @@ ensure_server() {
 dropdown_visible() {
   "$HYPRCTL" monitors -j | "$PYTHON" -c '
 import json, sys
+MAX = 262144
+raw = sys.stdin.buffer.read(MAX + 1)
+if len(raw) > MAX:
+    sys.exit(1)                      # over the cap: fail rather than parse a truncated document
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(raw) if raw else []
 except (json.JSONDecodeError, TypeError):
     sys.exit(1)
 for m in data:
@@ -126,8 +146,13 @@ sys.exit(1)
 client_count() {
   "$HYPRCTL" clients -j | "$PYTHON" -c '
 import json, sys
+MAX = 262144
+raw = sys.stdin.buffer.read(MAX + 1)
+if len(raw) > MAX:
+    print(0)
+    sys.exit(0)
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(raw) if raw else []
 except (json.JSONDecodeError, TypeError):
     print(0)
     sys.exit(0)
@@ -139,8 +164,21 @@ print(n)
 ' 2>/dev/null || echo 0
 }
 
+# The foot client socket path. XDG_RUNTIME_DIR is trusted only when it is an
+# absolute directory owned by this user (or root); otherwise fall back to the
+# systemd runtime path, so a relative or attacker-chosen value cannot point
+# footclient at a socket of someone else's choosing.
 server_socket() {
-  printf '%s/foot-dropdown-terminal.sock' "${XDG_RUNTIME_DIR:-/run/user/$UID}"
+  local rt="${XDG_RUNTIME_DIR:-}" st uid
+  if [ -n "$rt" ] && [ "${rt#/}" != "$rt" ] && [ -d "$rt" ]; then
+    st="$("$STAT_BIN" -L -c '%u' -- "$rt" 2>/dev/null)" || st=""
+    uid="$st"
+    if [ "$uid" != "$UID" ] && [ "$uid" != "0" ]; then rt=""; fi
+  else
+    rt=""
+  fi
+  [ -n "$rt" ] || rt="/run/user/$UID"
+  printf '%s/foot-dropdown-terminal.sock' "$rt"
 }
 
 spawn_client() {
@@ -156,8 +194,12 @@ spawn_client() {
 window_in_special() {
   "$HYPRCTL" clients -j | "$PYTHON" -c '
 import json, sys
+MAX = 262144
+raw = sys.stdin.buffer.read(MAX + 1)
+if len(raw) > MAX:
+    sys.exit(1)
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(raw) if raw else []
 except (json.JSONDecodeError, TypeError):
     sys.exit(1)
 for c in data:
@@ -172,8 +214,12 @@ sys.exit(1)
 active_is_dropdown() {
   "$HYPRCTL" activewindow -j | "$PYTHON" -c '
 import json, sys
+MAX = 262144
+raw = sys.stdin.buffer.read(MAX + 1)
+if len(raw) > MAX:
+    sys.exit(1)
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(raw) if raw.strip() not in (b"", b"{}") else {}
 except (json.JSONDecodeError, TypeError):
     sys.exit(1)
 sys.exit(0 if (d or {}).get("class") == "org.omarchy.dropdown-terminal" else 1)
@@ -184,8 +230,12 @@ sys.exit(0 if (d or {}).get("class") == "org.omarchy.dropdown-terminal" else 1)
 dropdown_pin_state() {
   "$HYPRCTL" clients -j | "$PYTHON" -c '
 import json, sys
+MAX = 262144
+raw = sys.stdin.buffer.read(MAX + 1)
+if len(raw) > MAX:
+    sys.exit(0)
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(raw) if raw else []
 except (json.JSONDecodeError, TypeError):
     sys.exit(0)
 for c in data:
@@ -196,10 +246,13 @@ for c in data:
 }
 
 unpin_if_pinned() {
-  # Pin toggle flips state, so only toggle when we know it is pinned.
+  # Pin toggle flips state, so only toggle when we know it is pinned. The address
+  # comes from the compositor and is spliced into a dispatch string, so validate
+  # its shape (a hex pointer) rather than trusting it verbatim.
   local addr pinned
   read -r addr pinned <<<"$(dropdown_pin_state)"
-  if [[ -n "$addr" && "$pinned" == "true" ]]; then
+  [[ "$addr" =~ ^0x[0-9a-fA-F]+$ ]] || return 0
+  if [[ "$pinned" == "true" ]]; then
     "$HYPRCTL" dispatch "hl.dsp.window.pin(\"$addr\")" >/dev/null 2>&1 || true
     "$SLEEP" 0.2
   fi
@@ -295,9 +348,16 @@ do_install() {
 do_uninstall() {
   "$PYTHON" "$BACKEND" uninstall
   "$SYSTEMCTL" --user daemon-reload
-  rm -f "$LOCAL_BIN"
+  "$RM" -f "$LOCAL_BIN"
   "$HYPRCTL" reload
   msg "Uninstalled (keybind, rules, unit, server all removed)."
+}
+
+do_watcher() {
+  # Internal: exec the focus watcher under the resolved interpreter. Panel.qml
+  # launches THIS instead of naming /usr/bin/python3 itself, so the interpreter is
+  # validated by the same resolver as every other tool the plugin runs.
+  exec "$PYTHON" -I -E -S "$SCRIPT_DIR/../backend/focus_watcher.py"
 }
 
 usage() {
@@ -313,6 +373,7 @@ commands:
   kill        stop the foot server (session ends)
   install     install keybind + rules + systemd unit
   uninstall   remove everything the plugin installed
+  watcher     internal: run the focus watcher (used by the bar widget)
 EOF
   printf '%s\n' "$text"
 }
@@ -327,6 +388,7 @@ main() {
     kill)      resolve_tools kill;      do_kill ;;
     install)   resolve_tools install;   do_install ;;
     uninstall) resolve_tools uninstall; do_uninstall ;;
+    watcher)   resolve_tools watcher;   do_watcher ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $cmd (see --help)" ;;
   esac

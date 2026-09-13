@@ -20,9 +20,14 @@ must satisfy three rules, because enabling the widget starts it automatically:
 
 Residual, documented rather than hidden: a child that deliberately escapes its
 process group (the foot client does this on purpose, via setsid, so the terminal
-session survives) is not reached by the group kill; and a file could in theory
-be swapped between validation and exec - that requires root, since the
-candidate directories and files are root-owned and not writable by us.
+session survives) is not reached by the group kill. And the resolve-then-exec
+sequence is not atomic: for a RESOLVED tool the window requires root, because the
+candidate directories and the file are root-owned and not writable by us; for the
+plugin's OWN scripts (the CLI, which is user-owned by design) a pre-exec swap
+needs only write access to the plugin directory - and anyone with that access can
+edit the plugin's code directly, so it is not a boundary worth pretending to
+hold. ``_revalidate()`` re-stats immediately before exec to shrink the window
+regardless.
 """
 
 import os
@@ -178,11 +183,23 @@ def tool(name):
 # --------------------------------------------------------------- execution
 
 
+def controlled_path():
+    """PATH for children: only candidate directories that actually validate.
+
+    Hard-coding the list would publish a directory that is not root-owned or is
+    group/world-writable on some layouts, which is the very property the resolver
+    exists to enforce. If none of them validate (an unusual environment), the
+    fixed list is used so helpers still work rather than losing PATH entirely.
+    """
+    trusted = [d for d in CANDIDATE_DIRS if _dir_trusted(d)]
+    return ":".join(trusted or CANDIDATE_DIRS)
+
+
 def build_env(base=None):
     """The minimal environment every automatic child gets."""
     source = os.environ if base is None else base
     env = {key: source[key] for key in ENV_ALLOW if source.get(key)}
-    env["PATH"] = CONTROLLED_PATH
+    env["PATH"] = controlled_path()
     return env
 
 
