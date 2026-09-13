@@ -545,6 +545,78 @@ class BackendTest(unittest.TestCase):
         self.assertIn(["--user", "mask"], verbs)
         self.assertIn(["--user", "unmask"], verbs)
 
+    def test_uninstall_prefights_config_dir_before_masking(self):
+        # An unusable XDG_CONFIG_HOME must abort BEFORE systemd is touched: no mask
+        # without unmask, no half-removed plugin.
+        backend.CALLS.clear()
+        with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/etc"}):
+            with self.assertRaises(SystemExit):
+                backend.uninstall()
+        verbs = [argv[1:3] for argv in backend.CALLS if argv[0].endswith("systemctl")]
+        self.assertEqual(verbs, [], "systemd ran before the config preflight")
+
+    def test_uninstall_unmasks_when_removal_fails_after_mask(self):
+        # A failure inside step 2 (after mask) must still unmask: simulate a lock
+        # failure and assert unmask + reload still run.
+        real_remove = backend.remove_block
+        backend.remove_block = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("cannot open the lock file")
+        )
+        try:
+            backend.CALLS.clear()
+            backend.uninstall()
+        finally:
+            backend.remove_block = real_remove
+        verbs = [argv[1:3] for argv in backend.CALLS if argv[0].endswith("systemctl")]
+        self.assertIn(["--user", "mask"], verbs)
+        self.assertIn(["--user", "unmask"], verbs)
+
+    def test_keybind_path_with_space_is_quoted_not_refused(self):
+        # A HOME with a space or UTF-8 name is legitimate: the path is shell-quoted
+        # (then Lua-escaped), not refused, and install writes nothing half-done.
+        real_home = backend.HOME
+        try:
+            backend.HOME = os.path.join(SANDBOX, "my home josé")
+            os.makedirs(os.path.join(backend.HOME, ".config", "hypr"), exist_ok=True)
+            body = backend.bind_body()
+            self.assertIn("omarchy-dropdown-terminal", body)
+            self.assertIn("toggle", body)
+            # shell-parseable: shlex must recover the path + toggle
+            import shlex
+
+            dispatcher = body.split('"')[5]
+            parts = shlex.split(dispatcher)
+            self.assertEqual(parts[-1], "toggle")
+            self.assertTrue(parts[0].endswith("omarchy-dropdown-terminal"))
+        finally:
+            backend.HOME = real_home
+
+    def test_symlinked_hypr_dir_outside_home_is_accepted_when_safe(self):
+        # ~/.config/hypr -> /mnt/dotfiles/hypr is a normal dotfiles layout: refuse
+        # only when the target is unsafe, not merely because it is outside HOME.
+        # (The target lives inside the sandbox so its ancestors are safe; a target
+        # under a world-writable ancestor such as /tmp is still refused.)
+        outside = os.path.join(SANDBOX, "dotfiles")
+        os.makedirs(outside, exist_ok=True)
+        os.chmod(outside, 0o700)
+        link_parent = os.path.join(SANDBOX, ".config")
+        os.makedirs(link_parent, exist_ok=True)
+        link = os.path.join(link_parent, "hypr-linktest")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(outside, link)
+        try:
+            backend._require_safe_write_target(os.path.join(link, "dropdown-terminal.lua"))
+        finally:
+            os.unlink(link)
+
+    def test_dangling_symlink_reads_as_absent(self):
+        link = os.path.join(SANDBOX, "dangling.lua")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(os.path.join(SANDBOX, "not-here.lua"), link)
+        self.assertIsNone(backend.read_text(link))
+
     def test_every_panel_process_is_started_and_panel_uses_no_raw_env_path(self):
         # A Process whose running flag is never set is dead code (that is how the
         # state-path query shipped inert). Each declared Process id must either set

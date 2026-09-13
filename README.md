@@ -218,7 +218,7 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 41 - config writes, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 46 - config writes, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
 python3 tests/test_focus_watcher.py  # 39 - event state machine, path validation, state file, socket
 ```

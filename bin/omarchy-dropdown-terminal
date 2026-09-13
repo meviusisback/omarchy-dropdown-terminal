@@ -16,8 +16,6 @@ set -euo pipefail
 PLUGIN_ID="meviusisback.dropdown-terminal"
 APP_ID="org.omarchy.dropdown-terminal"
 UNIT="foot-server@dropdown-terminal.service"
-SCRIPT_DIR="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd -P)"
-BACKEND="$SCRIPT_DIR/../backend/dropdown_terminal.py"
 
 msg() { printf '%s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -30,6 +28,26 @@ STAT_BIN=/usr/bin/stat
 READLINK_BIN=/usr/bin/readlink
 [ -x "$READLINK_BIN" ] || READLINK_BIN=/bin/readlink
 [ -x "$READLINK_BIN" ] || { printf 'Error: no usable readlink binary\n' >&2; exit 1; }
+
+# Resolve THIS script's real path before deriving anything from it. The installer
+# symlinks the CLI into ~/.local/bin and the keybind runs it through that link, where
+# `${BASH_SOURCE[0]%/*}` would yield ~/.local/bin and the backend would be looked for
+# outside the plugin.
+SELF="$("$READLINK_BIN" -f -- "${BASH_SOURCE[0]}" 2>/dev/null)" || SELF=""
+[ -n "$SELF" ] || die "cannot resolve the path of this script"
+SCRIPT_DIR="${SELF%/*}"
+BACKEND="$SCRIPT_DIR/../backend/dropdown_terminal.py"
+WATCHER="$SCRIPT_DIR/../backend/focus_watcher.py"
+
+# The instance signature is a path component in every hyprctl call: validate it the
+# way backend/focus_watcher.py does, so a traversing value cannot make hyprctl answer
+# from a socket outside the runtime directory.
+if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+  case "$HYPRLAND_INSTANCE_SIGNATURE" in
+    *[!A-Za-z0-9_]*|"") die "invalid HYPRLAND_INSTANCE_SIGNATURE" ;;
+  esac
+  [ ${#HYPRLAND_INSTANCE_SIGNATURE} -le 128 ] || die "invalid HYPRLAND_INSTANCE_SIGNATURE"
+fi
 
 # The real uid comes from the kernel, never from the environment: bash imports $UID
 # from the environment (so `env UID=0` would otherwise choose which socket we accept
@@ -176,9 +194,15 @@ dropdown_visible() { dropdown_probe; }
 
 # Count clients of the dropdown foot window.
 client_count() {
-  "$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
+  # The python prints a number for every outcome (empty, malformed, oversized), so it
+  # must NOT be combined with a shell fallback that appends a second line: two lines
+  # would make the arithmetic comparisons in do_open/do_close fail and silently skip
+  # the spawn. The cap is generous because we would rather read a large client list
+  # than SIGPIPE hyprctl into a bogus count.
+  local n
+  n="$("$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
 import json, sys
-MAX = 262144
+MAX = 4194304
 raw = sys.stdin.buffer.read(MAX + 1)
 if len(raw) > MAX:
     print(0)
@@ -188,12 +212,19 @@ try:
 except (json.JSONDecodeError, TypeError):
     print(0)
     sys.exit(0)
+if not isinstance(data, list):
+    print(0)
+    sys.exit(0)
 n = 0
 for c in data:
-    if c.get("class") == "org.omarchy.dropdown-terminal":
+    if isinstance(c, dict) and c.get("class") == "org.omarchy.dropdown-terminal":
         n += 1
 print(n)
-' 2>/dev/null || echo 0
+' 2>/dev/null)" || n=""
+  case "$n" in
+    ""|*[!0-9]*) n=0 ;;
+  esac
+  printf '%s' "$n"
 }
 
 # The foot client socket path. Both the directory rules AND the socket filename come
@@ -413,9 +444,10 @@ do_install() {
   local home_dir local_bin
   home_dir="$(validate_home)"
   local_bin="$home_dir/.local/bin/omarchy-dropdown-terminal"
+  [ "$SELF" != "$local_bin" ] || die "refusing to link $local_bin to itself (run the installer from the plugin directory, not through ~/.local/bin)"
   [ -e "$local_bin" ] && [ ! -L "$local_bin" ] && die "$local_bin exists and is not a symlink"
   "$MKDIR" -p "$home_dir/.local/bin" || die "cannot create $home_dir/.local/bin"
-  "$LN" -sfn "$SCRIPT_DIR/omarchy-dropdown-terminal" "$local_bin" || die "cannot link $local_bin"
+  "$LN" -sfn "$SELF" "$local_bin" || die "cannot link $local_bin"
   [ -x "$local_bin" ] || die "$local_bin is not executable after linking"
   "$PYTHON" -I -E -S -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$BACKEND" \
     || die "backend failed to compile"
@@ -454,7 +486,7 @@ do_watcher() {
   # Internal: exec the focus watcher under the resolved interpreter. Panel.qml
   # launches THIS instead of naming /usr/bin/python3 itself, so the interpreter is
   # validated by the same resolver as every other tool the plugin runs.
-  exec "$PYTHON" -I -E -S "$SCRIPT_DIR/../backend/focus_watcher.py"
+  exec "$PYTHON" -I -E -S "$WATCHER"
 }
 
 usage() {

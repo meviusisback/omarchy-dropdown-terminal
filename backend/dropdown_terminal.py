@@ -151,10 +151,31 @@ def _require_safe_write_target(path):
             "this user): refusing to write any config"
         )
     real = os.path.realpath(path)
-    if not os.path.isabs(path) or not any(
+    if os.path.isabs(path) and any(
         real.startswith(os.path.realpath(base) + os.sep) for base in allowed
     ):
-        raise SystemExit(f"refusing to write {path!r}: outside {' and '.join(allowed)}")
+        return
+    # A symlinked directory component (e.g. ~/.config/hypr -> /mnt/dotfiles/hypr)
+    # legitimately resolves outside HOME: accept it when the resolved target is
+    # itself safe (ours, no group/other bits, safe ancestors).
+    parent = os.path.dirname(real)
+    while parent and parent != "/" and not os.path.exists(parent):
+        parent = os.path.dirname(parent)
+    try:
+        st = os.stat(parent or "/")
+    except OSError:
+        st = None
+    if (
+        st is not None
+        and stat_module.S_ISDIR(st.st_mode)
+        and st.st_uid == os.getuid()
+        and not (st.st_mode & 0o022)
+    ):
+        import focus_watcher  # same ancestor rule the runtime dir uses
+
+        if focus_watcher._ancestors_safe(parent or "/", (0, os.getuid())):
+            return
+    raise SystemExit(f"refusing to write {path!r}: outside {' and '.join(allowed)}")
 
 # Ceiling for reading our own config files; see read_text().
 MAX_CONFIG_BYTES = 1 << 20
@@ -283,8 +304,9 @@ o.window("{DROPDOWN_APP_ID}", {{
 
 HOOK_LINE = (
     f"-- Added by the {MARKER} plugin: installs the drop-down terminal window rules.\n"
-    'do local path = (os.getenv("XDG_CONFIG_HOME") or os.getenv("HOME") .. "/.config") '
-    '.. "/hypr/dropdown-terminal.lua"; local file = io.open(path, "r"); '
+    'do local x = os.getenv("XDG_CONFIG_HOME"); '
+    'if not x or x == "" or x:sub(1, 1) ~= "/" then x = os.getenv("HOME") .. "/.config" end; '
+    'local path = x .. "/hypr/dropdown-terminal.lua"; local file = io.open(path, "r"); '
     "if file then file:close(); dofile(path) end end\n"
 )
 
@@ -302,22 +324,26 @@ def _lua_escape(value):
 
 
 def cli_command():
-    """The absolute CLI path for the keybind, or a loud failure.
+    """The absolute CLI path for the keybind, shell-quoted then Lua-escaped.
 
-    The path is interpolated into a Lua string that becomes a shell command, so HOME
-    must not contain anything that could break out of either (a space, quote,
-    backslash, `;`, `$`...). Refusing is better than writing a keybind that is broken
-    or, worse, executes something else.
+    The path is interpolated into a Lua double-quoted string that Omarchy turns
+    into a shell command, so it must survive both parsers: shell-quote first
+    (single quotes, handling embedded quotes), then escape for Lua. Only newlines
+    and other control characters are refused - spaces and UTF-8 names are valid in
+    both languages once quoted.
     """
     if not HOME:
         raise SystemExit("cannot determine a safe HOME: refusing to write the keybind")
     path = os.path.join(HOME, ".local", "bin", "omarchy-dropdown-terminal")
-    if not SAFE_KEYBIND_PATH_RE.match(path):
+    if not path.startswith("/") or any(c in path for c in ("\n", "\r", "\0")):
         raise SystemExit(
-            f"HOME cannot be written into a keybind safely ({HOME!r}): it contains "
-            "characters that would need shell/Lua escaping"
+            f"HOME cannot be written into a keybind safely ({HOME!r})"
         )
-    return _lua_escape(path)
+    if re.match(r"\A[A-Za-z0-9._/+=-]+\Z", path):
+        quoted = path
+    else:
+        quoted = "'" + path.replace("'", "'\\''") + "'"
+    return _lua_escape(quoted)
 
 
 def bind_body():
@@ -437,6 +463,15 @@ def atomic_write(path, content, mode=0o644):
             if st is not None and not stat_module.S_ISLNK(st.st_mode):
                 os.chmod(tmp_path, stat_module.S_IMODE(st.st_mode))
                 os.chown(tmp_path, st.st_uid, st.st_gid)
+            elif st is not None and stat_module.S_ISLNK(st.st_mode):
+                # A symlink is REPLACED by os.replace below, so keep the target's
+                # read permissions (a 0600 dotfiles target must not become 0644),
+                # but never chown: the link target may be owned by someone else.
+                try:
+                    target_mode = stat_module.S_IMODE(os.stat(path).st_mode)
+                except OSError:
+                    target_mode = mode
+                os.chmod(tmp_path, target_mode)
             else:
                 os.chmod(tmp_path, mode)
         except OSError:
@@ -475,6 +510,8 @@ def read_text(path, limit=MAX_CONFIG_BYTES):
         if stat_module.S_ISLNK(st.st_mode):
             try:
                 st = os.stat(path)
+            except FileNotFoundError:
+                return None  # dangling dotfiles link: os.replace handles it
             except OSError as exc:
                 raise ConfigUnreadable(f"cannot follow {path}: {exc}") from exc
         if not stat_module.S_ISREG(st.st_mode):
@@ -582,9 +619,12 @@ def install(quiet=False):
     # 0a. Read (and therefore validate) every file we are about to modify BEFORE
     #     writing anything: an unreadable or oversized config aborts the install with
     #     nothing half-applied - including this plugin's own rules file, which used to
-    #     be written before the check.
-    for path in (UNIT_DST_PATH, HYPRLAND_LUA, BINDINGS_LUA):
+    #     be written before the check. The keybind body is built here too, so a HOME
+    #     that cannot be written into a keybind aborts before the first write.
+    for path in (UNIT_DST_PATH, HYPRLAND_LUA, BINDINGS_LUA, RULES_PATH):
         read_text(path)
+    require_config_dir()
+    bind_body()
 
     # 0. The plugin's own executables are pinned by absolute shebang and the
     #    generated unit will use the resolved foot path, so verify those
@@ -602,7 +642,14 @@ def install(quiet=False):
         )
     results["tools"] = tools
 
-    # 1. Hyprland rules file (always regenerated, marker-checked).
+    # 1. Hyprland rules file (always regenerated, marker-checked). A foreign file
+    #    without our marker is backed up first, the same way a foreign unit is.
+    existing_rules = read_text(RULES_PATH)
+    if existing_rules is not None and RULES_BEGIN not in existing_rules:
+        backup = RULES_PATH + ".pre-dropdown-terminal.bak"
+        if not os.path.exists(backup) or os.path.islink(backup):
+            atomic_write(backup, existing_rules)
+            print(f"backed up existing {RULES_PATH} -> {backup}")
     atomic_write(RULES_PATH, RULES_BODY)
     results["rules_file"] = RULES_PATH
 
@@ -644,9 +691,10 @@ def uninstall():
     results = {}
     require_home()
 
-    # Validate the configs BEFORE touching systemd: an unreadable file must not leave
-    # the unit disabled+masked with our keybind block still installed and no way to
-    # retry (the previous order disabled the unit first and then raised).
+    # Validate the configs AND the config directory BEFORE touching systemd: an
+    # unreadable file - or an XDG_CONFIG_HOME that fails validation at write time -
+    # must not leave the unit disabled+masked with our blocks still installed.
+    require_config_dir()
     for path in (UNIT_DST_PATH, HYPRLAND_LUA, BINDINGS_LUA, RULES_PATH):
         read_text(path)
 
@@ -657,35 +705,41 @@ def uninstall():
             break
         time.sleep(0.25)
     _call("systemctl", "--user", "kill", "--kill-whom=main", UNIT_REF)
-    _call("systemctl", "--user", "mask", UNIT_REF)
-    results["unit"] = "stopped+disabled+masked"
+    try:
+        _call("systemctl", "--user", "mask", UNIT_REF)
+        results["unit"] = "stopped+disabled+masked"
 
-    # 2. Remove the keybind block, the hook line, the rules file. A corrupted marker
-    #    block is reported, not fatal: aborting here would leave the unit masked (step
-    #    3 never runs) and every retry would fail at the same place.
-    try:
-        results["keybind_removed"] = remove_block(BINDINGS_LUA, BIND_BEGIN, BIND_END)
-    except ValueError as exc:
-        results["keybind_removed"] = f"skipped: {exc}"
-    try:
-        results["hook_removed"] = _remove_hook_line()
-    except ValueError as exc:
-        results["hook_removed"] = f"skipped: {exc}"
-    try:
-        os.unlink(RULES_PATH)
-        results["rules_file"] = "removed"
-    except FileNotFoundError:
-        results["rules_file"] = "absent"
-
-    # 3. Unmask + remove unit file + reload. In a finally: whatever happened above,
-    #    a masked unit must never survive an uninstall (it would block a reinstall).
-    try:
+        # 2. Remove the keybind block, the hook line, the rules file. Failures are
+        #    reported, not fatal: aborting here would leave the unit masked and every
+        #    retry would fail at the same place.
         try:
-            os.unlink(UNIT_DST_PATH)
-            results["unit_file"] = "removed"
+            results["keybind_removed"] = remove_block(BINDINGS_LUA, BIND_BEGIN, BIND_END)
+        except (ValueError, ConfigUnreadable, RuntimeError, OSError, SystemExit) as exc:
+            results["keybind_removed"] = f"skipped: {exc}"
+        try:
+            results["hook_removed"] = _remove_hook_line()
+        except (ValueError, ConfigUnreadable, RuntimeError, OSError, SystemExit) as exc:
+            results["hook_removed"] = f"skipped: {exc}"
+        try:
+            os.unlink(RULES_PATH)
+            results["rules_file"] = "removed"
         except FileNotFoundError:
-            results["unit_file"] = "absent"
+            results["rules_file"] = "absent"
+        except OSError as exc:
+            results["rules_file"] = f"skipped: {exc}"
+
+        # 3. Remove unit file.
+        try:
+            try:
+                os.unlink(UNIT_DST_PATH)
+                results["unit_file"] = "removed"
+            except FileNotFoundError:
+                results["unit_file"] = "absent"
+        except OSError as exc:
+            results["unit_file"] = f"skipped: {exc}"
     finally:
+        # A masked unit must never survive an uninstall (it would block a reinstall),
+        # whatever happened above.
         _call("systemctl", "--user", "unmask", UNIT_REF)
         _call("systemctl", "--user", "daemon-reload")
 
