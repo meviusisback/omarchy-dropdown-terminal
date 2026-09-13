@@ -8,16 +8,22 @@ the environment's real tool ownership.
 """
 
 import importlib
+import json
 import os
 import re
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 SANDBOX = tempfile.mkdtemp(prefix="ddt-test-")
 os.environ["HOME"] = SANDBOX
 BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 sys.path.insert(0, BACKEND_DIR)
+
+# Uids the ancestor walk may trust in this environment: the dev sandbox maps uid 0
+# to 65534 (unmapped in the user namespace), so tests inject that too.
+TEST_UIDS = (0, os.getuid(), os.stat("/").st_uid)
 
 backend = importlib.import_module("dropdown_terminal")
 
@@ -236,14 +242,64 @@ class BackendTest(unittest.TestCase):
         self.assertNotIn('["python3"', panel)
         self.assertIn('root.cliArgv(["watcher"])', panel)
         self.assertIn('root.cliArgv(["status"])', panel)
-        # Every automatic process clears the environment first.
+        # The state path is asked for, never derived from a raw env variable.
+        self.assertIn('root.cliArgv(["state-path"])', panel)
+        self.assertNotIn('Quickshell.env("XDG_RUNTIME_DIR") + "/dropdown-terminal.state"', panel)
+        # Every automatic process clears the environment first, PATH included.
         self.assertIn('"/usr/bin/env"', panel)
         self.assertIn('"-i"', panel)
-        self.assertIn('"PATH=/usr/bin:/bin:/usr/local/bin"', panel)
+        self.assertNotIn('"PATH=/usr/bin', panel)
         # The isolated-interpreter flags live where the interpreter is resolved.
         with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
             cli = handle.read()
         self.assertIn('exec "$PYTHON" -I -E -S', cli)
+
+    def test_runtime_dir_rules_live_in_one_place(self):
+        # The CLI and the widget must not re-implement the runtime-dir rules: they
+        # ask the backend, whose focus_watcher.runtime_dir() is the only validator.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        self.assertIn('"$PYTHON" "$BACKEND" runtime-dir', cli)
+        self.assertIn('"$PYTHON" "$BACKEND" state-path', cli)
+        self.assertNotIn('/run/user/$UID', cli)      # no second fallback rule
+        # the real uid comes from the kernel, not from a settable variable
+        self.assertIn("-L -c '%u' -- /proc/self", cli)
+        runtime, state = backend.runtime_paths(TEST_UIDS)
+        self.assertTrue(runtime.startswith("/"))
+        self.assertEqual(state, os.path.join(runtime, "dropdown-terminal.state"))
+
+    def test_runtime_paths_fails_loudly_without_a_safe_directory(self):
+        # No acceptable runtime dir must be an error, not a silent fallback to
+        # somewhere a local attacker could plant the state file or the socket.
+        with unittest.mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/etc"}):
+            with self.assertRaises(SystemExit) as caught:
+                backend.runtime_paths(())   # trust nobody: no candidate can pass
+        self.assertIn("no safe runtime directory", str(caught.exception))
+
+    def test_status_output_is_bounded_and_validated(self):
+        # The widget reads this JSON as text with no size cap of its own, so the
+        # backend must not echo an oversized or non-hex "address" back to it.
+        huge = "0x" + "a" * 4096
+        payload = json.dumps([{
+            "class": backend.DROPDOWN_APP_ID,
+            "address": huge,
+            "workspace": {"name": "w" * 4096},
+        }])
+        original = backend._call
+
+        def fake_call(name, *args, timeout=10, **kwargs):
+            if name == "hyprctl" and args[:1] == ("clients",):
+                return backend.proc.Result(0, payload, "")
+            return backend.proc.Result(0, "active", "")
+
+        backend._call = fake_call
+        try:
+            out = backend.status()
+        finally:
+            backend._call = original
+        self.assertIsNone(out["window"])          # not the compositor's hex shape
+        self.assertLessEqual(len(out["workspace"]), 64)
 
     def test_cli_resolves_every_tool_its_commands_use(self):
         # Regression: `close` calls pull_window_into_special -> unpin_if_pinned,
@@ -256,7 +312,9 @@ class BackendTest(unittest.TestCase):
         self.assertIn('uninstall)   wanted="hyprctl python3 systemctl rm"', cli)
         # and the variables those lists resolve are the ones actually used
         self.assertIn('"$SLEEP" 0.2', cli)
-        self.assertIn('"$RM" -f "$LOCAL_BIN"', cli)
+        self.assertIn('"$RM" -f "$home_dir/.local/bin/omarchy-dropdown-terminal"', cli)
+        self.assertIn('"$LN" -sfn', cli)
+        self.assertIn('home_dir="$(validate_home)"', cli)
 
     def test_cli_need_guards_match_the_python_resolver(self):
         # The bash twin must reject what resolve() rejects: `.`/`..`, directories,

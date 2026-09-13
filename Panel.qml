@@ -38,16 +38,28 @@ Panel {
   // the slow reconcile timer below stays active (see the fallback Timer).
   property bool stateFileSeen: false
 
-  // Where the watcher publishes visibility. Only an ABSOLUTE runtime dir is
-  // accepted: an empty or relative value must never become a path at "/".
-  readonly property string stateFile: {
-    const rt = Quickshell.env("XDG_RUNTIME_DIR") || ""
-    return rt.startsWith("/") ? rt + "/dropdown-terminal.state" : ""
+  // Where the watcher publishes visibility. The path is ASKED FOR, not derived from
+  // a raw environment variable: the CLI prints the path the backend validated (the
+  // runtime-dir rules live in backend/focus_watcher.py and all three consumers use
+  // them), so the widget cannot end up watching a directory the watcher refused -
+  // say a world-writable one where any local user could plant the file.
+  property string stateFile: ""
+
+  Process {
+    id: statePathProc
+    command: root.cliArgv(["state-path"])
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        const path = text.trim()
+        if (path.startsWith("/")) root.stateFile = path
+      }
+    }
   }
 
   // Event-driven state: the watcher rewrites this file whenever the dropdown is
-  // shown or hidden, so the icon tracks it with zero idle wakeups. A missing,
-  // oversized or malformed file keeps the previous state, and only the
+  // shown or hidden, so the icon tracks it and nothing polls on a schedule. A
+  // missing, oversized or malformed file keeps the previous state, and only the
   // `visible` boolean is ever read - it is never interpolated into a command.
   FileView {
     id: stateFileView
@@ -57,6 +69,7 @@ Panel {
     onLoaded: root.readState()
     // text() is stale inside the change signal, so reload() first.
     onFileChanged: reload()
+    onLoadFailed: { /* no state file yet: keep the previous value */ }
   }
 
   function readState() {
@@ -79,15 +92,18 @@ Panel {
   // needs are passed back in explicitly. The tools themselves are then resolved to
   // validated absolute paths inside the CLI. /usr/bin/env is the one hard-coded
   // path here: something must be the first exec, and a root-owned system path is
-  // the honest place to stop.
+  // the honest place to stop. The CLI's own stdout is what the collectors below
+  // read, and it is fixed-shape: the backend caps every compositor-supplied string
+  // (Quickshell 0.3.1's StdioCollector has no maxBufferSize to set).
   readonly property var cliEnvPassthrough: [
     "XDG_RUNTIME_DIR", "HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"
   ]
 
   function cliArgv(args) {
-    const argv = ["/usr/bin/env", "-i",
-                  "HOME=" + (Quickshell.env("HOME") || ""),
-                  "PATH=/usr/bin:/bin:/usr/local/bin"]
+    // No PATH at all: the CLI resolves every tool to a validated absolute path, so
+    // there is nothing for a hostile PATH entry to win. (proc.build_env() sets a
+    // filtered PATH for the Python side's children, which is a different layer.)
+    const argv = ["/usr/bin/env", "-i", "HOME=" + (Quickshell.env("HOME") || "")]
     for (const name of root.cliEnvPassthrough) {
       const value = Quickshell.env(name) || ""
       if (value !== "") argv.push(name + "=" + value)
@@ -134,10 +150,10 @@ Panel {
     }
   }
 
-  // Fallback only: with no absolute XDG_RUNTIME_DIR - or while the state file has
-  // never loaded, e.g. because the watcher validated a different runtime dir -
-  // there is nothing to watch, so reconcile against the CLI slowly instead of
-  // showing a permanently stale icon. In a normal session this timer is inert.
+  // Fallback only: while there is no state path to watch (the backend refused every
+  // candidate runtime dir) or the file has never loaded, reconcile against the CLI
+  // slowly instead of showing a permanently stale icon - and never treat an
+  // unvalidated path as authoritative. In a normal session this timer is inert.
   Timer {
     id: fallbackRefreshTimer
     interval: 30000

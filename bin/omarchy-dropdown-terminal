@@ -18,7 +18,6 @@ APP_ID="org.omarchy.dropdown-terminal"
 UNIT="foot-server@dropdown-terminal.service"
 SCRIPT_DIR="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd -P)"
 BACKEND="$SCRIPT_DIR/../backend/dropdown_terminal.py"
-LOCAL_BIN="$HOME/.local/bin/omarchy-dropdown-terminal"
 
 msg() { printf '%s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -31,6 +30,11 @@ STAT_BIN=/usr/bin/stat
 READLINK_BIN=/usr/bin/readlink
 [ -x "$READLINK_BIN" ] || READLINK_BIN=/bin/readlink
 [ -x "$READLINK_BIN" ] || { printf 'Error: no usable readlink binary\n' >&2; exit 1; }
+
+# The real uid comes from the kernel: bash's $UID is a variable, so `env UID=0`
+# would otherwise choose which runtime directory (and socket) we act on.
+REAL_UID="$("$STAT_BIN" -L -c '%u' -- /proc/self 2>/dev/null)" || REAL_UID=""
+[ -n "$REAL_UID" ] || { printf 'Error: cannot determine the real uid\n' >&2; exit 1; }
 
 # 0 when $1 is a root-owned directory that group/others cannot write, walking up
 # to / — an attacker-writable directory in the chain would void the check.
@@ -88,6 +92,7 @@ resolve_tools() {
     install)     wanted="foot hyprctl python3 systemctl mkdir ln" ;;
     uninstall)   wanted="hyprctl python3 systemctl rm" ;;
     watcher)     wanted="python3" ;;
+    state-path)  wanted="python3" ;;
     *)           wanted="" ;;
   esac
   for name in $wanted; do
@@ -164,21 +169,12 @@ print(n)
 ' 2>/dev/null || echo 0
 }
 
-# The foot client socket path. XDG_RUNTIME_DIR is trusted only when it is an
-# absolute directory owned by this user (or root); otherwise fall back to the
-# systemd runtime path, so a relative or attacker-chosen value cannot point
-# footclient at a socket of someone else's choosing.
+# The foot client socket path. The rules for what counts as a safe runtime
+# directory live in ONE place - focus_watcher.runtime_dir(), reached through the
+# backend - so the CLI, the watcher and the widget cannot disagree: absolute,
+# owned by the real uid, no group/other bits, safe ancestor chain, never HOME.
 server_socket() {
-  local rt="${XDG_RUNTIME_DIR:-}" st uid
-  if [ -n "$rt" ] && [ "${rt#/}" != "$rt" ] && [ -d "$rt" ]; then
-    st="$("$STAT_BIN" -L -c '%u' -- "$rt" 2>/dev/null)" || st=""
-    uid="$st"
-    if [ "$uid" != "$UID" ] && [ "$uid" != "0" ]; then rt=""; fi
-  else
-    rt=""
-  fi
-  [ -n "$rt" ] || rt="/run/user/$UID"
-  printf '%s/foot-dropdown-terminal.sock' "$rt"
+  "$PYTHON" "$BACKEND" runtime-dir || die "no safe runtime directory for the foot socket"
 }
 
 spawn_client() {
@@ -187,7 +183,20 @@ spawn_client() {
   # first summon must spawn one; later summons reuse the existing window.
   # setsid detaches it into its own session on purpose, so the session
   # survives this CLI exiting.
-  "$SETSID" "$FOOTCLIENT" --server-socket="$(server_socket)" >/dev/null 2>&1 &
+  local sock
+  sock="$(server_socket)"
+  # If something is already bound there it must be a socket of ours: attaching to
+  # a socket someone else bound would hand them the session's keystrokes.
+  if [ -e "$sock" ]; then
+    local st
+    st="$("$STAT_BIN" -L -c '%F %u' -- "$sock" 2>/dev/null)" || die "cannot inspect $sock"
+    case "$st" in
+      socket\ *) ;;
+      *) die "refusing to use $sock: not a socket" ;;
+    esac
+    [ "${st##* }" = "$REAL_UID" ] || die "refusing to use $sock: it is not ours"
+  fi
+  "$SETSID" "$FOOTCLIENT" --server-socket="$sock" >/dev/null 2>&1 &
   disown || true
 }
 
@@ -330,15 +339,33 @@ do_status() {
   "$PYTHON" "$BACKEND" status
 }
 
+# HOME is needed only by install/uninstall (the ~/.local/bin symlink), and it is
+# validated here rather than at startup: the automatic hide path never needs it, so
+# a session without HOME must not break `close`.
+validate_home() {
+  local home="${HOME:-}" st uid
+  case "$home" in
+    /*) ;;
+    *) die "HOME must be an absolute path (got '${home}')" ;;
+  esac
+  [ -d "$home" ] || die "HOME is not a directory: $home"
+  st="$("$STAT_BIN" -L -c '%u' -- "$home" 2>/dev/null)" || die "cannot stat HOME: $home"
+  uid="$st"
+  [ "$uid" = "$REAL_UID" ] || die "HOME is not owned by this user: $home"
+  printf '%s' "$home"
+}
+
 do_install() {
   # Everything the plugin cannot do for itself: config edits + the user unit.
+  local home_dir
+  home_dir="$(validate_home)"
   "$PYTHON" -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$BACKEND" \
     || die "backend failed to compile"
   "$PYTHON" "$BACKEND" install
   "$SYSTEMCTL" --user daemon-reload
   "$SYSTEMCTL" --user enable --now "$UNIT"
-  "$MKDIR" -p "$HOME/.local/bin"
-  "$LN" -sfn "$SCRIPT_DIR/omarchy-dropdown-terminal" "$LOCAL_BIN"
+  "$MKDIR" -p "$home_dir/.local/bin"
+  "$LN" -sfn "$SCRIPT_DIR/omarchy-dropdown-terminal" "$home_dir/.local/bin/omarchy-dropdown-terminal"
   "$HYPRCTL" reload
   msg "Installed. Press SUPER + U to drop the terminal."
   msg "Bar widget: $PLUGIN_ID (enable via omarchy plugin enable)."
@@ -346,11 +373,19 @@ do_install() {
 }
 
 do_uninstall() {
+  local home_dir
+  home_dir="$(validate_home)"
   "$PYTHON" "$BACKEND" uninstall
   "$SYSTEMCTL" --user daemon-reload
-  "$RM" -f "$LOCAL_BIN"
+  "$RM" -f "$home_dir/.local/bin/omarchy-dropdown-terminal"
   "$HYPRCTL" reload
   msg "Uninstalled (keybind, rules, unit, server all removed)."
+}
+
+do_state_path() {
+  # Internal: the state file the watcher writes / the widget watches. Asking here
+  # keeps Panel.qml from repeating (or diverging from) the runtime-dir rules.
+  "$PYTHON" "$BACKEND" state-path
 }
 
 do_watcher() {
@@ -374,6 +409,7 @@ commands:
   install     install keybind + rules + systemd unit
   uninstall   remove everything the plugin installed
   watcher     internal: run the focus watcher (used by the bar widget)
+  state-path  internal: print the validated state-file path (used by the widget)
 EOF
   printf '%s\n' "$text"
 }
@@ -389,6 +425,7 @@ main() {
     install)   resolve_tools install;   do_install ;;
     uninstall) resolve_tools uninstall; do_uninstall ;;
     watcher)   resolve_tools watcher;   do_watcher ;;
+    state-path) resolve_tools state-path; do_state_path ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $cmd (see --help)" ;;
   esac

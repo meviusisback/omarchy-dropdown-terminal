@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Development notes / plans: not part of the published plugin. They contain local
+# absolute paths and host details, they are not needed at runtime, and the
+# marketplace scanner counts any `systemctl` mention in them towards this plugin's
+# declared capabilities.
+.hermes/

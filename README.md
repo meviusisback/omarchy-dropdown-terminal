@@ -147,12 +147,15 @@ your regular foot windows are untouched.
 - Only one dropdown window at a time (by design - it's a Quake dropdown).
 - Wayland-only (Hyprland). X11 is not supported.
 - The bar widget's state is event-driven: the watcher publishes
-  `$XDG_RUNTIME_DIR/dropdown-terminal.state` (0600, written atomically) whenever
-  the dropdown is shown or hidden, and the widget watches that file - no polling.
-  The runtime directory is validated (absolute, owned by you, no group/other bits,
-  ancestors not writable by others, and not `$HOME`); if nothing qualifies, both
-  sides fall back to the systemd path, and if the state file never appears the
-  widget reconciles against the CLI every 30 s instead of showing a stale icon.
+  `$XDG_RUNTIME_DIR/dropdown-terminal.state` (0600, written atomically, and only
+  when visibility actually changes) whenever the dropdown is shown or hidden, and
+  the widget watches that file - no polling. The path is not guessed on either
+  side: the widget asks the CLI (`state-path`), the CLI asks the backend, and the
+  backend validates the directory once for all three consumers (absolute, owned by
+  you, no group/other bits, ancestors not writable by others, and not `$HOME`).
+  If no directory qualifies, the systemd path is used when it passes the same
+  rules, and otherwise the widget reconciles against the CLI every 30 s instead of
+  showing a stale icon.
 - Dismissal is **click-based**: clicking another window closes the dropdown and
   focuses that window. Clicking *bare desktop background* (no window under the
   cursor) raises no Hyprland event, and clicking the bar does not move keyboard
@@ -162,19 +165,22 @@ your regular foot windows are untouched.
   `systemctl`, `footclient`, `setsid`, `rm`, ...) to a validated absolute path
   from a fixed list of root-owned directories, and refuse anything owned by
   another user, group/world-writable, not a regular file, or reached through a
-  directory chain that is not equally trusted; `PATH` is never consulted, so a
-  malicious earlier entry cannot be launched by enabling the widget. The one
-  hard-coded path is `/usr/bin/env`, which runs the watcher with a cleared
+  directory chain that is not equally trusted. The CLI and the watcher are started
+  with a cleared environment and **no `PATH` at all**, so a malicious earlier entry
+  cannot be launched by enabling the widget - there is nothing to look up. The one
+  hard-coded path is `/usr/bin/env`, which runs the watcher with that cleared
   environment (`-i`, only the variables it needs) and an isolated interpreter
-  (`-I -E -S`) - something must be the first exec, so it stops at a root-owned
-  system path. Children get an environment allowlist plus a `PATH` built only
-  from directories that actually validate, and captured output is capped at
-  256 KiB with the process group killed on overflow or timeout and then reaped.
+  (`-I -E -S`); something must be the first exec, so it stops at a root-owned
+  system path. Python-side children get an environment allowlist plus a `PATH`
+  built only from directories that actually validate, and captured output is
+  capped at 256 KiB with the process group killed on overflow or timeout and then
+  reaped.
 - The focus watcher subscribes to Hyprland's event socket instead of polling
-  (idle cost is zero wakeups, versus ~430k `hyprctl` spawns/day when polled at
-  5 Hz). If the socket is missing or stale, it degrades to a 2 s poll and returns
-  to the event path as soon as the socket accepts a connection again - dismissal
-  never depends on the event path working.
+  (idle cost is one liveness round trip per minute, versus ~430k `hyprctl` spawns
+  per day when polled at 5 Hz). If the socket is missing, stale or silent, it
+  degrades to a 2 s poll and returns to the event path as soon as the socket
+  accepts a connection again - dismissal never depends on the event path working,
+  and a failed probe is never mistaken for the user focusing another window.
 - `omarchy plugin validate .` and the unit tests below cover these guarantees.
 - The plugin sets three global input options in
   `~/.config/hypr/dropdown-terminal.lua`: `special_fallthrough = true`,
@@ -203,9 +209,9 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 23 - config writes, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 26 - config writes, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
-python3 tests/test_focus_watcher.py  # 30 - event state machine, path validation, state file, socket
+python3 tests/test_focus_watcher.py  # 36 - event state machine, path validation, state file, socket
 ```
 
 ## License

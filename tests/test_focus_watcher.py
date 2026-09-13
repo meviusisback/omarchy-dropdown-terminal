@@ -8,6 +8,7 @@ covered without a compositor.
 
 import json
 import os
+import pwd
 import socket
 import stat
 import sys
@@ -57,6 +58,16 @@ class StateMachineTest(unittest.TestCase):
         self.assertTrue(self.w.visible)
         self.assertEqual(self.w.feed("activespecial>>,HDMI-A-1"), "state")
         self.assertFalse(self.w.visible)
+
+    def test_repeated_visibility_reports_no_change(self):
+        # Only a real change may return "state": the degraded poll feeds the same
+        # activespecial line every 2 s, and rewriting the file 43k times a day would
+        # both waste work and keep waking the widget's FileView.
+        self.assertEqual(self.w.feed(f"activespecial>>{WS},HDMI-A-1"), "state")
+        self.assertIsNone(self.w.feed(f"activespecial>>{WS},HDMI-A-1"))
+        self.assertIsNone(self.w.feed(f"activespecialv2>>-98,{WS},HDMI-A-1"))
+        self.assertEqual(self.w.feed("activespecial>>,HDMI-A-1"), "state")
+        self.assertIsNone(self.w.feed("activespecial>>,HDMI-A-1"))
 
     def test_activespecialv2_prefixes_the_id(self):
         self.w.feed(f"activespecialv2>>-98,{WS},HDMI-A-1")
@@ -135,6 +146,15 @@ class RuntimeDirTest(unittest.TestCase):
                     watcher_mod.runtime_dir(self.SANDBOX_UIDS), f"/run/user/{os.getuid()}"
                 )
 
+    def test_home_guard_survives_an_empty_home(self):
+        # expanduser("~") returns "/" for an empty HOME, which silently disabled the
+        # HOME/ancestor refusal; the passwd entry must be used instead.
+        real_home = pwd.getpwuid(os.getuid()).pw_dir
+        with _env("HOME", ""):
+            self.assertEqual(watcher_mod.home_dir(), real_home)
+        with _env("HOME", "relative/home"):
+            self.assertEqual(watcher_mod.home_dir(), real_home)
+
     def test_returns_none_when_nothing_is_acceptable(self):
         with _env("XDG_RUNTIME_DIR", "/etc"):
             # /etc is root-owned but not ours, and the fallback is still valid here;
@@ -211,19 +231,59 @@ class SocketPathTest(unittest.TestCase):
 
 
 class ToolCallGuardTest(unittest.TestCase):
-    def test_is_visible_and_active_class_never_raise(self):
-        # A failing proc.run (bad tool path, spawn error) must degrade to "no
-        # information" rather than propagating out of the watcher loop.
+    """Failed probes are 'no information', never a value, never a hide."""
+
+    def setUp(self):
+        self._real_run = watcher_mod.proc.run
+        self.addCleanup(lambda: setattr(watcher_mod.proc, "run", self._real_run))
+
+    def _run_returns(self, result):
+        watcher_mod.proc.run = lambda *args, **kwargs: result
+
+    def test_failed_command_is_none_not_false(self):
+        self._run_returns(watcher_mod.proc.Result(1, "", "boom"))
+        self.assertIsNone(watcher_mod.is_visible("/usr/bin/hyprctl"))
+        self.assertIsNone(watcher_mod.active_class("/usr/bin/hyprctl"))
+
+    def test_malformed_output_is_none(self):
+        self._run_returns(watcher_mod.proc.Result(0, "not json", ""))
+        self.assertIsNone(watcher_mod.is_visible("/usr/bin/hyprctl"))
+        self.assertIsNone(watcher_mod.active_class("/usr/bin/hyprctl"))
+
+    def test_raising_run_is_folded_into_none(self):
         def boom(*args, **kwargs):
             raise ValueError("bad argv")
 
-        original = watcher_mod.proc.run
         watcher_mod.proc.run = boom
-        try:
-            self.assertFalse(watcher_mod.is_visible("/usr/bin/hyprctl"))
-            self.assertEqual(watcher_mod.active_class("/usr/bin/hyprctl"), "")
-        finally:
-            watcher_mod.proc.run = original
+        self.assertIsNone(watcher_mod.is_visible("/usr/bin/hyprctl"))
+        self.assertIsNone(watcher_mod.active_class("/usr/bin/hyprctl"))
+
+    def test_good_probes_report_their_value(self):
+        self._run_returns(watcher_mod.proc.Result(
+            0, json.dumps([{"specialWorkspace": {"name": watcher_mod.SPECIAL_WS}}]), ""))
+        self.assertTrue(watcher_mod.is_visible("/usr/bin/hyprctl"))
+        self._run_returns(watcher_mod.proc.Result(
+            0, json.dumps([{"specialWorkspace": None}]), ""))
+        self.assertFalse(watcher_mod.is_visible("/usr/bin/hyprctl"))
+        self._run_returns(watcher_mod.proc.Result(0, json.dumps({"class": "foot"}), ""))
+        self.assertEqual(watcher_mod.active_class("/usr/bin/hyprctl"), "foot")
+
+    def test_poll_tick_never_hides_on_a_failed_probe(self):
+        # Regression: the degraded tick used to feed the empty-string sentinel as a
+        # real activewindow change, so one failed hyprctl call while the terminal was
+        # focused and visible hid it mid-typing.
+        hidden = []
+        real_hide = watcher_mod.hide_dropdown
+        watcher_mod.hide_dropdown = lambda: hidden.append(True)
+        self.addCleanup(lambda: setattr(watcher_mod, "hide_dropdown", real_hide))
+        watcher = watcher_mod.Watcher()
+        watcher.visible = True
+        watcher.focused = True
+        self._run_returns(watcher_mod.proc.Result(1, "", "hyprctl unavailable"))
+        watcher_mod.poll_tick(watcher, os.path.join(tempfile.mkdtemp(), "state"), "/usr/bin/hyprctl")
+        self.assertEqual(hidden, [])
+        self.assertTrue(watcher.visible)
+        self.assertTrue(watcher.focused)
 
     def test_run_tool_folds_tool_not_found(self):
         def missing(*args, **kwargs):

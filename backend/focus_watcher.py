@@ -36,8 +36,8 @@ closed.
 import fcntl
 import json
 import os
+import pwd
 import re
-import selectors
 import signal
 import socket
 import stat
@@ -56,6 +56,8 @@ POLL_RECHECK_TICKS = 15  # degraded mode: look for the event socket again (~30 s
 MAX_LINE = 4096          # bytes; longer event lines are dropped, not buffered
 MAX_BUFFER = 65536       # bytes of unterminated event data we will hold
 HIDE_TIMEOUT = 8.0
+EVENT_IDLE_TIMEOUT = 60.0  # recv timeout: a silent socket is probed once a minute
+LIVENESS_TIMEOUT = 3.0
 SIGNATURE_RE = re.compile(r"\A[A-Za-z0-9_]{1,128}\Z")
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -111,10 +113,12 @@ class Watcher:
             fields = payload.split(",")
             name = fields[1] if (event == "activespecialv2" and len(fields) > 1) else fields[0]
             if name == self.workspace:
+                changed = not self.visible
                 self.visible = True
-                return "state"
+                return "state" if changed else None
+            changed = self.visible
             self.visible = False
-            return "state"
+            return "state" if changed else None
 
         return None
 
@@ -162,6 +166,30 @@ def _ancestors_safe(path, ancestor_uids=None):
         current = parent
 
 
+def home_dir():
+    """The real home directory, validated the way the backend validates it.
+
+    os.path.expanduser("~") returns "/" for an empty HOME - exactly what Panel.qml
+    passes when the session has no HOME - which silently disables the
+    "not HOME (nor an ancestor)" guard below. Falls back to the passwd entry.
+    """
+    candidates = [os.environ.get("HOME", "")]
+    try:
+        candidates.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:  # pragma: no cover
+        pass
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            st = os.stat(candidate)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+            return os.path.realpath(candidate)
+    return None
+
+
 def runtime_dir(ancestor_uids=None):
     """The session runtime directory, or None when nothing acceptable exists.
 
@@ -171,13 +199,15 @@ def runtime_dir(ancestor_uids=None):
     XDG_RUNTIME_DIR cannot redirect the state file, the lock or the socket path
     into a directory whose name someone else could swap - and the systemd
     per-user path is accepted as the fallback because it satisfies the same rules.
+    This is the single implementation of that rule: the CLI and the widget ask the
+    backend for the path instead of repeating it.
     """
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = home_dir()
     for candidate in (os.environ.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}"):
         if not candidate or not os.path.isabs(candidate):
             continue
         real = os.path.realpath(candidate)
-        if home == real or home.startswith(real + os.sep):
+        if home is not None and (home == real or home.startswith(real + os.sep)):
             continue  # HOME (or an ancestor of it) is not a runtime directory
         if not _uid_owned_dir(real):
             continue
@@ -229,15 +259,17 @@ def can_connect(path, timeout=1.0):
     retrying forever would silently stop hiding the dropdown. Used to decide
     between the event path and the polling fallback.
     """
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection = None
     try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.settimeout(timeout)
         connection.connect(path)
         return True
     except OSError:
         return False
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
 
 def write_state(path, visible):
@@ -289,27 +321,43 @@ def hide_dropdown():
 
 
 def is_visible(hyprctl):
+    """True/False when the compositor answered, None when the probe failed.
+
+    None must not be folded into False: "no information" and "hidden" lead to
+    different actions in the caller (one is a skipped tick, the other can hide the
+    terminal out from under the user).
+    """
     result = run_tool([hyprctl, "monitors", "-j"])
     if result.returncode != 0:
-        return False
+        return None
     try:
-        for monitor in json.loads(result.stdout):
-            name = ((monitor.get("specialWorkspace") or {}).get("name")) or ""
-            if name == SPECIAL_WS:
-                return True
+        monitors = json.loads(result.stdout)
     except (json.JSONDecodeError, AttributeError, TypeError):
-        return False
+        return None
+    for monitor in monitors:
+        try:
+            name = ((monitor.get("specialWorkspace") or {}).get("name")) or ""
+        except AttributeError:
+            continue
+        if name == SPECIAL_WS:
+            return True
     return False
 
 
 def active_class(hyprctl):
+    """The active window's class, or None when the probe failed (see is_visible)."""
     result = run_tool([hyprctl, "activewindow", "-j"])
     if result.returncode != 0:
-        return ""
+        return None
     try:
         return json.loads(result.stdout).get("class") or ""
     except (json.JSONDecodeError, AttributeError, TypeError):
-        return ""
+        return None
+
+
+def compositor_alive(hyprctl):
+    """One cheap round trip used as a liveness probe for a silent event socket."""
+    return run_tool([hyprctl, "monitors", "-j"], timeout=LIVENESS_TIMEOUT).returncode == 0
 
 
 # -------------------------------------------------------------------- loops
@@ -348,12 +396,23 @@ def event_loop(watcher, state_path, hyprctl, rt):
             backoff = min(backoff * 2, 5.0)
             continue
         backoff = 0.5
+        failures = 0  # a successful subscription resets the strike count
         log("subscribed to the Hyprland event socket")
         buffer = b""
+        connection.settimeout(EVENT_IDLE_TIMEOUT)
         try:
             while True:
                 try:
                     chunk = connection.recv(8192)
+                except socket.timeout:
+                    # A socket that accepts but never delivers (hung compositor,
+                    # half-open connection) must not park the watcher forever: probe
+                    # the compositor once a minute and fall back to polling if the
+                    # round trip fails. Idle cost is this one probe per minute.
+                    if not compositor_alive(hyprctl):
+                        log("event socket silent and the compositor is not answering")
+                        break
+                    continue
                 except OSError as exc:
                     log(f"event socket read failed: {exc}")
                     break
@@ -376,18 +435,33 @@ def event_loop(watcher, state_path, hyprctl, rt):
         time.sleep(0.5)
 
 
+def poll_tick(watcher, state_path, hyprctl):
+    """One degraded-mode tick: probe, then feed ONLY what the probes returned.
+
+    A probe that failed yields None and is skipped entirely: feeding "no
+    information" as a fabricated focus change would hide the terminal out from
+    under the user mid-keystroke.
+    """
+    visible = is_visible(hyprctl)
+    if visible is not None:
+        name = SPECIAL_WS if visible else ""
+        handle(watcher, state_path, watcher.feed(f"activespecial>>{name},-"))
+    focused = active_class(hyprctl)
+    if focused is not None:
+        handle(watcher, state_path, watcher.feed(f"activewindow>>{focused},"))
+
+
 def poll_loop(watcher, state_path, hyprctl, rt):
     """Degraded mode for an engine without the event socket.
 
     Slower (2 s, not 5 Hz) and reaped per call, but it keeps click-to-dismiss
-    working, and it returns to the event path if the socket appears later.
+    working, and it returns to the event path once the socket accepts connections
+    again.
     """
     log("polling the compositor every 2s (degraded mode)")
     ticks = 0
     while True:
-        visible = is_visible(hyprctl)
-        handle(watcher, state_path, watcher.feed(f"activespecial>>{SPECIAL_WS if visible else ''},-"))
-        handle(watcher, state_path, watcher.feed(f"activewindow>>{active_class(hyprctl)},"))
+        poll_tick(watcher, state_path, hyprctl)
         ticks += 1
         if ticks % POLL_RECHECK_TICKS == 0:
             path = socket_path(rt)
@@ -439,7 +513,10 @@ def main():
 
     state_path = os.path.join(rt, STATE_NAME)
     watcher = Watcher()
-    watcher.visible = is_visible(hyprctl)
+    initial = is_visible(hyprctl)
+    # A failed first probe must not claim the dropdown is hidden: keep it False (the
+    # safe default for "we do not know") and let the loop correct it.
+    watcher.visible = initial if initial is not None else False
     write_state(state_path, watcher.visible)
 
     time.sleep(STARTUP_GRACE)

@@ -12,8 +12,9 @@ Design guarantees:
   - Every rewrite is atomic: temp file + os.replace, preserving mode/ownership.
   - All config-file edits are serialized with an flock'd lockfile.
   - Idempotency keys off plugin-owned marker comments, never loose substrings.
-  - No user-controlled data is interpolated into any written file; the rules,
-    hook, bind, and unit files are fixed constants.
+  - Only validated values reach written files: the rules/hook/bind bodies are
+    fixed constants, and the unit's ExecStart interpolates the foot path that
+    proc.resolve() validated (never user input).
   - Subprocess calls are argv arrays only; no shell=True anywhere.
   - Every external tool is resolved to a validated absolute path (never PATH)
     and runs with a minimal environment and bounded output - see proc.py.
@@ -24,6 +25,7 @@ import fcntl
 import json
 import os
 import pwd
+import re
 import stat as stat_module
 import sys
 import tempfile
@@ -61,7 +63,13 @@ def _validated_home():
 
 
 HOME = _validated_home()
+
+# Ceiling for reading our own config files; see read_text().
+MAX_CONFIG_BYTES = 1 << 20
 MARKER = "meviusisback.dropdown-terminal"
+
+# Window addresses are echoed to the bar widget; only the compositor's own shape.
+WINDOW_RE = re.compile(r"\A0x[0-9a-fA-F]{1,32}\Z")
 
 HYPRLAND_DIR = os.path.join(HOME, ".config", "hypr")
 RULES_PATH = os.path.join(HYPRLAND_DIR, "dropdown-terminal.lua")
@@ -290,12 +298,22 @@ def atomic_write(path, content, mode=0o644):
             os.unlink(tmp_path)
 
 
-def read_text(path):
+def read_text(path, limit=MAX_CONFIG_BYTES):
+    """Read a config file, bounded.
+
+    These are files we only ever write ourselves (rules, hook, unit), so the cap is
+    about never letting a runaway or device-backed file (e.g. a planted symlink to
+    /dev/zero) make an automatic install read without bound; an unreadable or
+    oversized file is reported as absent, and the caller regenerates it.
+    """
     try:
-        with open(path, "r") as f:
-            return f.read()
-    except FileNotFoundError:
+        with open(path, "rb") as handle:
+            data = handle.read(limit + 1)
+    except (OSError, ValueError):
         return None
+    if len(data) > limit:
+        return None
+    return data.decode("utf-8", "replace")
 
 
 def append_block(path, begin, body, end):
@@ -368,9 +386,14 @@ def install_unit(foot=None):
     if existing is not None and MARKER not in existing:
         backup = UNIT_DST_PATH + ".pre-dropdown-terminal.bak"
         if not os.path.exists(backup):
-            with open(UNIT_DST_PATH, "rb") as src, open(backup, "wb") as dst:
-                dst.write(src.read())
-            print(f"backed up existing {UNIT_DST_PATH} -> {backup}")
+            with open(UNIT_DST_PATH, "rb") as src:
+                data = src.read(MAX_CONFIG_BYTES + 1)
+            if len(data) > MAX_CONFIG_BYTES:
+                print(f"refusing to back up {UNIT_DST_PATH}: over {MAX_CONFIG_BYTES} bytes")
+            else:
+                with open(backup, "wb") as dst:
+                    dst.write(data)
+                print(f"backed up existing {UNIT_DST_PATH} -> {backup}")
     atomic_write(UNIT_DST_PATH, unit_body(foot))
     _call("systemctl", "--user", "daemon-reload")
     return True
@@ -385,9 +408,10 @@ def install(quiet=False):
     results = {}
 
     # 0. The plugin's own executables are pinned by absolute shebang and the
-    #    unit hard-codes /usr/bin/foot, so verify those interpreters/binaries
-    #    exist at trusted absolute paths before writing anything: an
-    #    unsupported layout must fail loudly, not leave a half-installed plugin.
+    #    generated unit will use the resolved foot path, so verify those
+    #    interpreters/binaries exist at trusted absolute paths before writing
+    #    anything: an unsupported layout must fail loudly, not leave a
+    #    half-installed plugin.
     tools = {name: proc.resolve(name) for name in ("python3", "bash", "foot")}
     missing = sorted(name for name, path in tools.items() if path is None)
     if missing:
@@ -493,9 +517,31 @@ def _remove_hook_line():
 # --------------------------------------------------------------------- status
 
 
+def _bounded(value, limit=64):
+    """Cap a compositor-supplied string before it is echoed to the widget.
+
+    The bar widget reads this JSON as text with no size cap (Quickshell 0.3.1's
+    StdioCollector has no maxBufferSize), so a hostile or broken compositor must not
+    be able to hand it a megabyte-long "address" or workspace name.
+    """
+    if value is None:
+        return None
+    return str(value)[:limit]
+
+
+def window_address(value):
+    """The address, or None - validated, not truncated: only the compositor's shape.
+
+    Truncating first would turn a 4 KB hex string into something that still looks
+    like an address, so the length is part of the validation.
+    """
+    text = "" if value is None else str(value)
+    return text if WINDOW_RE.match(text) else None
+
+
 def status():
     out = {"server": "unknown", "window": None, "workspace": None, "keybind": "SUPER + U"}
-    unit = _call("systemctl", "--user", "is-active", UNIT_REF).stdout.strip()
+    unit = _bounded(_call("systemctl", "--user", "is-active", UNIT_REF).stdout.strip(), 32)
     out["server"] = unit or "unknown"
 
     clients = _call("hyprctl", "clients", "-j").stdout
@@ -503,8 +549,8 @@ def status():
         data = json.loads(clients) if clients else []
         for c in data:
             if c.get("class") == DROPDOWN_APP_ID:
-                out["window"] = c.get("address")
-                out["workspace"] = (c.get("workspace") or {}).get("name")
+                out["window"] = window_address(c.get("address"))
+                out["workspace"] = _bounded((c.get("workspace") or {}).get("name"))
                 break
     except (json.JSONDecodeError, AttributeError, TypeError):
         pass  # hyprctl unavailable or malformed output: keep safe fallback
@@ -526,6 +572,26 @@ def status():
     return out
 
 
+def runtime_paths(ancestor_uids=None):
+    """The validated runtime directory and the state file inside it.
+
+    Single source of truth: the CLI (for the foot client socket) and Panel.qml (for
+    the state file the widget watches) both ask here instead of re-implementing the
+    rules, so the three consumers cannot disagree about which directory is safe.
+    `ancestor_uids` is only for tests (see focus_watcher._ancestors_safe).
+    Raises SystemExit when no safe directory exists.
+    """
+    import focus_watcher  # sibling module: owns the runtime-dir validation
+
+    runtime = focus_watcher.runtime_dir(ancestor_uids)
+    if runtime is None:
+        raise SystemExit(
+            "no safe runtime directory (need an absolute, self-owned dir with no "
+            "group/other bits, ancestors not writable by others, and not HOME)"
+        )
+    return runtime, os.path.join(runtime, focus_watcher.STATE_NAME)
+
+
 # ----------------------------------------------------------------------- main
 
 
@@ -537,6 +603,10 @@ def main():
         uninstall()
     elif cmd == "status":
         status()
+    elif cmd == "runtime-dir":
+        print(runtime_paths()[0])
+    elif cmd == "state-path":
+        print(runtime_paths()[1])
     elif cmd == "check-conflict":
         conflict = check_keybind_conflict()
         print(conflict or "no conflict")
