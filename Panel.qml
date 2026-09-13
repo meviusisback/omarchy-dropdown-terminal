@@ -119,6 +119,9 @@ Panel {
 
   function runAction(action) {
     if (busy) return
+    // Allowlist: action becomes a CLI subcommand, so a future caller must not be
+    // able to reach destructive subcommands (uninstall) through this path.
+    if (action !== "toggle" && action !== "open" && action !== "close" && action !== "kill") return
     busy = true
     actionProc.command = root.cliArgv([action])
     actionProc.running = true
@@ -133,7 +136,14 @@ Panel {
       onStreamFinished: {
         try {
           const parsed = JSON.parse(text || "{}")
-          if (parsed && typeof parsed === "object") root.ddState = parsed
+          // Merge known keys with type checks, like readState below: a
+          // compromised CLI output must not inject arbitrary keys/types.
+          if (parsed && typeof parsed === "object") {
+            if (typeof parsed.visible === "boolean") root.ddState.visible = parsed.visible
+            for (const key of ["server", "window", "workspace", "keybind"]) {
+              if (typeof parsed[key] === "string" && parsed[key].length <= 256) root.ddState[key] = parsed[key]
+            }
+          }
         } catch (e) { /* keep previous state on malformed output */ }
         root.busy = false
       }

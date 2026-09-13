@@ -721,8 +721,23 @@ def uninstall():
         except (ValueError, ConfigUnreadable, RuntimeError, OSError, SystemExit) as exc:
             results["hook_removed"] = f"skipped: {exc}"
         try:
-            os.unlink(RULES_PATH)
-            results["rules_file"] = "removed"
+            rules_text = read_text(RULES_PATH)
+            if rules_text is None:
+                results["rules_file"] = "absent"
+            elif RULES_BEGIN not in rules_text:
+                # Not ours (a foreign file replaced it after install, or install
+                # never wrote it): leave it alone, never delete someone else's config.
+                results["rules_file"] = "skipped: not ours, leaving in place"
+            else:
+                os.unlink(RULES_PATH)
+                results["rules_file"] = "removed"
+                backup = RULES_PATH + ".pre-dropdown-terminal.bak"
+                if os.path.exists(backup) and not os.path.islink(backup):
+                    try:
+                        atomic_write(RULES_PATH, read_text(backup) or "")
+                        results["rules_file"] = "restored from backup"
+                    except (OSError, ValueError, ConfigUnreadable, SystemExit) as exc:
+                        results["rules_file"] = f"removed, backup restore skipped: {exc}"
         except FileNotFoundError:
             results["rules_file"] = "absent"
         except OSError as exc:

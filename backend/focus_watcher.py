@@ -381,8 +381,14 @@ def compositor_alive(hyprctl):
 # -------------------------------------------------------------------- loops
 
 
-def handle(watcher, state_path, action):
+def handle(watcher, state_path, action, rt=None):
     if action == "state":
+        if rt is not None and runtime_dir() != rt:
+            # The runtime dir was swapped (symlink/rename) after startup
+            # validation: the state path no longer points where we checked.
+            # Skip the write rather than publish into an unvalidated tree.
+            log("runtime directory changed under us; skipping state write")
+            return
         write_state(state_path, watcher.visible)
     elif action == "hide":
         log("focus left the dropdown; hiding")
@@ -398,10 +404,31 @@ def event_loop(watcher, state_path, hyprctl, rt):
         if path is None:
             log("no trusted event socket available; leaving the event path")
             return
+        try:
+            before = (os.lstat(path).st_dev, os.lstat(path).st_ino)
+        except OSError:
+            continue  # vanished between validation and stat: revalidate
         connection = None
         try:
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.connect(path)  # blocking: an idle watcher is never woken
+            try:
+                after = (os.lstat(path).st_dev, os.lstat(path).st_ino)
+            except OSError:
+                after = None
+            if after != before:
+                # The socket was swapped between validation and connect (or
+                # during it): drop this connection and revalidate from scratch.
+                # (SO_PEERCRED after connect could not help: a same-uid forger
+                # and the compositor carry the same credential. The dev/ino
+                # comparison is what binds this fd to the validated file.)
+                log("event socket changed during connect; reconnecting")
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+                connection = None
+                continue
         except OSError as exc:
             if connection is not None:
                 connection.close()
@@ -449,7 +476,7 @@ def event_loop(watcher, state_path, hyprctl, rt):
                     continue
                 while b"\n" in buffer:
                     raw, buffer = buffer.split(b"\n", 1)
-                    handle(watcher, state_path, watcher.feed(raw))
+                    handle(watcher, state_path, watcher.feed(raw), rt)
         finally:
             try:
                 connection.close()
@@ -458,7 +485,7 @@ def event_loop(watcher, state_path, hyprctl, rt):
         time.sleep(0.5)
 
 
-def poll_tick(watcher, state_path, hyprctl):
+def poll_tick(watcher, state_path, hyprctl, rt=None):
     """One degraded-mode tick: probe, then feed ONLY what the probes returned.
 
     A probe that failed yields None and is skipped entirely: feeding "no
@@ -468,10 +495,10 @@ def poll_tick(watcher, state_path, hyprctl):
     visible = is_visible(hyprctl)
     if visible is not None:
         name = SPECIAL_WS if visible else ""
-        handle(watcher, state_path, watcher.feed(f"activespecial>>{name},-"))
+        handle(watcher, state_path, watcher.feed(f"activespecial>>{name},-"), rt)
     focused = active_class(hyprctl)
     if focused is not None:
-        handle(watcher, state_path, watcher.feed(f"activewindow>>{focused},"))
+        handle(watcher, state_path, watcher.feed(f"activewindow>>{focused},"), rt)
 
 
 def poll_loop(watcher, state_path, hyprctl, rt):
@@ -484,7 +511,7 @@ def poll_loop(watcher, state_path, hyprctl, rt):
     log("polling the compositor every 2s (degraded mode)")
     ticks = 0
     while True:
-        poll_tick(watcher, state_path, hyprctl)
+        poll_tick(watcher, state_path, hyprctl, rt)
         ticks += 1
         if ticks % POLL_RECHECK_TICKS == 0:
             path = socket_path(rt)

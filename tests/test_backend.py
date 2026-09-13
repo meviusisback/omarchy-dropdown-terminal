@@ -571,6 +571,26 @@ class BackendTest(unittest.TestCase):
         self.assertIn(["--user", "mask"], verbs)
         self.assertIn(["--user", "unmask"], verbs)
 
+    def test_uninstall_leaves_a_foreign_rules_file_alone(self):
+        # A rules file without our marker is someone else's config: uninstall
+        # must not delete it.
+        os.makedirs(os.path.dirname(backend.RULES_PATH), exist_ok=True)
+        with open(backend.RULES_PATH, "w") as handle:
+            handle.write("-- someone else's config\n")
+        backend.uninstall()
+        with open(backend.RULES_PATH) as handle:
+            self.assertEqual(handle.read(), "-- someone else's config\n")
+
+    def test_uninstall_restores_backed_up_rules_file(self):
+        os.makedirs(os.path.dirname(backend.RULES_PATH), exist_ok=True)
+        with open(backend.RULES_PATH, "w") as handle:
+            handle.write(backend.RULES_BEGIN + "\n" + "rules\n" + backend.RULES_END + "\n")
+        with open(backend.RULES_PATH + ".pre-dropdown-terminal.bak", "w") as handle:
+            handle.write("-- original rules\n")
+        backend.uninstall()
+        with open(backend.RULES_PATH) as handle:
+            self.assertEqual(handle.read(), "-- original rules\n")
+
     def test_keybind_path_with_space_is_quoted_not_refused(self):
         # A HOME with a space or UTF-8 name is legitimate: the path is shell-quoted
         # (then Lua-escaped), not refused, and install writes nothing half-done.

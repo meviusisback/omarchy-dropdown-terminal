@@ -78,7 +78,8 @@ What it does:
    `dropdown-terminal` instance - a persistent `foot` server with a dedicated
    app-id (`org.omarchy.dropdown-terminal`) and its own socket, so it never
    touches your normal foot setup.
-2. Writes `~/.config/hypr/dropdown-terminal.lua` (window rules) and hooks it
+2. Writes `dropdown-terminal.lua` (window rules) under the Hyprland config dir
+   (`$XDG_CONFIG_HOME/hypr`, or `~/.config/hypr` when unset) and hooks it
    into `~/.config/hypr/hyprland.lua` (same pattern as the Omarchy
    workspace-layout plugin).
 3. Appends a marker-anchored keybind block to `~/.config/hypr/bindings.lua`:
@@ -218,9 +219,9 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 46 - config writes, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 48 - config writes, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
-python3 tests/test_focus_watcher.py  # 39 - event state machine, path validation, state file, socket
+python3 tests/test_focus_watcher.py  # 41 - event state machine, path validation, state file, socket
 ```
 
 ## License

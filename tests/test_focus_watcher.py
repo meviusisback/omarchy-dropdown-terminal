@@ -334,6 +334,32 @@ class StateFileTest(unittest.TestCase):
         os.chmod(self.runtime, 0o700)
         self.path = os.path.join(self.runtime, watcher_mod.STATE_NAME)
 
+    def test_handle_skips_state_write_when_runtime_dir_changed(self):
+        # The runtime dir was swapped after startup validation: publishing into
+        # the unvalidated tree would desync the widget, so the write is skipped.
+        watcher = watcher_mod.Watcher()
+        watcher.visible = True
+        real_runtime_dir = watcher_mod.runtime_dir
+        watcher_mod.runtime_dir = lambda: "/elsewhere-now"
+        self.addCleanup(lambda: setattr(watcher_mod, "runtime_dir", real_runtime_dir))
+        logged = []
+        real_log = watcher_mod.log
+        watcher_mod.log = logged.append
+        self.addCleanup(lambda: setattr(watcher_mod, "log", real_log))
+        watcher_mod.handle(watcher, self.path, "state", rt=self.runtime)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertTrue(any("skipping state write" in line for line in logged))
+
+    def test_handle_writes_when_runtime_dir_unchanged(self):
+        watcher = watcher_mod.Watcher()
+        watcher.visible = True
+        real_runtime_dir = watcher_mod.runtime_dir
+        watcher_mod.runtime_dir = lambda: self.runtime
+        self.addCleanup(lambda: setattr(watcher_mod, "runtime_dir", real_runtime_dir))
+        watcher_mod.handle(watcher, self.path, "state", rt=self.runtime)
+        with open(self.path) as handle:
+            self.assertIs(json.load(handle)["visible"], True)
+
     def test_writes_json_at_0600_without_leftovers(self):
         self.assertTrue(watcher_mod.write_state(self.path, True))
         with open(self.path) as handle:
