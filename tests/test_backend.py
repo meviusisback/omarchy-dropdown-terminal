@@ -18,6 +18,10 @@ import unittest.mock
 
 SANDBOX = tempfile.mkdtemp(prefix="ddt-test-")
 os.environ["HOME"] = SANDBOX
+# XDG_CONFIG_HOME decides where the config lives (Hyprland reads it), so pin it into
+# the sandbox too: without this the suite operates on the developer's real
+# ~/.config (it did, and the read-only sandbox root is what stopped it).
+os.environ["XDG_CONFIG_HOME"] = os.path.join(SANDBOX, ".config")
 BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 sys.path.insert(0, BACKEND_DIR)
 
@@ -260,7 +264,7 @@ class BackendTest(unittest.TestCase):
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
             cli = handle.read()
-        self.assertIn('"$PYTHON" -I -E -S "$BACKEND" socket-path', cli)
+        self.assertIn("run_backend socket-path", cli)
         self.assertIn("run_backend state-path", cli)
         self.assertNotIn('/run/user/$UID', cli)      # no second fallback rule
         # the real uid comes from the kernel, not from a settable variable
@@ -355,21 +359,64 @@ class BackendTest(unittest.TestCase):
     def test_socket_path_matches_the_unit_that_binds_it(self):
         # The CLI used to build "<runtime>/foot-dropdown-terminal.sock" itself and a
         # refactor dropped the filename: footclient was handed the runtime DIRECTORY
-        # and the new ownership guard then aborted every first summon. Assert the
-        # value (behaviour) and that it still matches the unit's %t/foot-%i.sock.
-        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        # and the ownership guard then aborted every first summon. The DIRECTORY must
+        # also be systemd's %t, which is what the unit binds - not this process's
+        # XDG_RUNTIME_DIR.
         sock = backend.socket_path(TEST_UIDS)
         self.assertTrue(sock.endswith("/foot-dropdown-terminal.sock"), sock)
-        self.assertEqual(os.path.dirname(sock), backend.runtime_paths(TEST_UIDS)[0])
+        self.assertEqual(os.path.dirname(sock), f"/run/user/{os.getuid()}")
         unit_bind = "--server=%t/foot-%i.sock".replace("%i", backend.UNIT_INSTANCE)
-        self.assertTrue(sock.endswith("/" + os.path.basename(unit_bind)))
+        self.assertEqual(os.path.basename(sock), os.path.basename(unit_bind))
         self.assertIn("--server=%t/foot-%i.sock", backend.unit_body("/usr/bin/foot"))
-        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
-            cli = handle.read()
-        self.assertIn('"$PYTHON" -I -E -S "$BACKEND" socket-path', cli)
-        self.assertIn("run_backend state-path", cli)
-        # the CLI must ask for the socket FILE, not the directory
-        self.assertNotIn('"$BACKEND" runtime-dir', cli)
+        self.assertEqual(backend.FOOT_SOCKET_NAME, f"foot-{backend.UNIT_INSTANCE}.sock")
+
+    def test_state_path_no_longer_diverges_from_the_watcher(self):
+        import focus_watcher
+
+        runtime, state = backend.runtime_paths(TEST_UIDS)
+        self.assertEqual(os.path.basename(state), focus_watcher.STATE_NAME)
+
+    def test_bind_uses_the_absolute_cli_path_not_path_lookup(self):
+        # Omarchy's o.bind turns a string dispatcher into hl.dsp.exec_cmd, i.e. a
+        # shell command resolved through the compositor's PATH.
+        self.assertIn(
+            f"{backend.HOME}/.local/bin/omarchy-dropdown-terminal toggle", backend.BIND_BODY
+        )
+        self.assertNotIn('"omarchy-dropdown-terminal toggle"', backend.BIND_BODY)
+
+    def test_config_dir_follows_xdg_config_home(self):
+        # Hyprland (and the Lua hook) find the config through XDG_CONFIG_HOME: writing
+        # to $HOME/.config while it points elsewhere installs rules nobody loads.
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+                self.assertEqual(backend._validated_config_dir(), tmp)
+            with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative/path"}):
+                self.assertEqual(backend._validated_config_dir(), f"{backend.HOME}/.config")
+            with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/etc"}):
+                # not ours: never write there
+                self.assertEqual(backend._validated_config_dir(), f"{backend.HOME}/.config")
+        # the module constants were derived at import from this sandbox
+        self.assertTrue(backend.HYPRLAND_DIR.startswith(SANDBOX))
+
+    def test_unreadable_config_aborts_before_touching_systemd(self):
+        # Uninstall used to disable+mask the unit and then raise on the config read,
+        # leaving a half-removed plugin that could not be retried.
+        with open(backend.BINDINGS_LUA, "w") as handle:
+            handle.write("x" * (backend.MAX_CONFIG_BYTES + 10))
+        backend.CALLS.clear()
+        with self.assertRaises(backend.ConfigUnreadable):
+            backend.uninstall()
+        self.assertEqual(backend.CALLS, [], "systemctl ran before the config check")
+
+    def test_backup_replaces_a_planted_symlink_instead_of_following_it(self):
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        target = os.path.join(SANDBOX, "elsewhere")
+        with open(backend.UNIT_DST_PATH, "w") as handle:
+            handle.write("# foreign unit\n")
+        os.symlink(target, backend.UNIT_DST_PATH + ".pre-dropdown-terminal.bak")
+        backend.install_unit("/usr/bin/foot")
+        self.assertTrue(os.path.isfile(backend.UNIT_DST_PATH + ".pre-dropdown-terminal.bak"))
+        self.assertFalse(os.path.lexists(target), "the symlink target was written through")
 
     def test_every_panel_process_is_started_and_panel_uses_no_raw_env_path(self):
         # A Process whose running flag is never set is dead code (that is how the
@@ -418,6 +465,16 @@ class BackendTest(unittest.TestCase):
         bare_backend = re.compile(r'"\$PYTHON"\s+"\$BACKEND"')
         self.assertIsNone(bare_backend.search(source), "backend run without -I -E -S")
         self.assertIn('"$PYTHON" -I -E -S "$BACKEND"', source)
+        # ... and so does every inline python probe
+        bare_probe = re.compile(r'"\$PYTHON"\s+-c')
+        self.assertIsNone(bare_probe.search(source), "inline probe without -I -E -S")
+        # the socket type test must not parse a TRANSLATED stat string (comments
+        # explain the trap and are allowed to name it)
+        code = "\n".join(line for line in lines if not line.strip().startswith("#"))
+        self.assertNotIn("%F", code)
+        self.assertIn("16#f000", code)
+        # the real uid is never taken from the environment
+        self.assertNotIn('REAL_UID="${UID', code)
 
 
 if __name__ == "__main__":

@@ -76,15 +76,40 @@ def require_home():
     return HOME
 
 
-def _require_under_home(path):
-    """Guard every write: nothing may land outside a validated HOME.
+def _validated_config_dir():
+    """$XDG_CONFIG_HOME when it is absolute and ours, else $HOME/.config.
+
+    Hyprland and the Lua hook find the config through XDG_CONFIG_HOME, so writing
+    to $HOME/.config while that variable points elsewhere would install rules the
+    compositor never loads.
+    """
+    candidate = os.environ.get("XDG_CONFIG_HOME", "")
+    if candidate and os.path.isabs(candidate):
+        try:
+            st = os.stat(candidate)
+        except OSError:
+            st = None
+        if st is not None and stat_module.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+            return candidate.rstrip("/")
+    return os.path.join(HOME, ".config") if HOME else ""
+
+
+def _require_safe_write_target(path):
+    """Guard every write: inside HOME or the validated config directory.
 
     Belt and braces for the case where HOME was unusable at import time and the
     module-level paths below therefore point nowhere useful.
     """
-    home = require_home()
-    if not os.path.isabs(path) or not path.startswith(home + os.sep):
-        raise SystemExit(f"refusing to write {path!r}: outside {home}")
+    allowed = [base for base in (HOME, _validated_config_dir()) if base]
+    if not allowed:
+        raise SystemExit(
+            "cannot determine a safe HOME (unset, relative, missing, or not owned by "
+            "this user): refusing to write any config"
+        )
+    if not os.path.isabs(path) or not any(
+        path.startswith(base + os.sep) for base in allowed
+    ):
+        raise SystemExit(f"refusing to write {path!r}: outside {' and '.join(allowed)}")
 
 # Ceiling for reading our own config files; see read_text().
 MAX_CONFIG_BYTES = 1 << 20
@@ -93,13 +118,13 @@ MARKER = "meviusisback.dropdown-terminal"
 # Window addresses are echoed to the bar widget; only the compositor's own shape.
 WINDOW_RE = re.compile(r"\A0x[0-9a-fA-F]{1,32}\Z")
 
-HYPRLAND_DIR = os.path.join(HOME, ".config", "hypr")
+HYPRLAND_DIR = os.path.join(_validated_config_dir(), "hypr")
 RULES_PATH = os.path.join(HYPRLAND_DIR, "dropdown-terminal.lua")
 HYPRLAND_LUA = os.path.join(HYPRLAND_DIR, "hyprland.lua")
 BINDINGS_LUA = os.path.join(HYPRLAND_DIR, "bindings.lua")
 LOCK_PATH = os.path.join(HYPRLAND_DIR, ".dropdown-terminal.lock")
 
-SYSTEMD_USER_DIR = os.path.join(HOME, ".config", "systemd", "user")
+SYSTEMD_USER_DIR = os.path.join(_validated_config_dir(), "systemd", "user")
 UNIT_SRC_NAME = "foot-server@.service"
 UNIT_DST_PATH = os.path.join(SYSTEMD_USER_DIR, UNIT_SRC_NAME)
 UNIT_INSTANCE = "dropdown-terminal"
@@ -220,7 +245,14 @@ HOOK_LINE = (
 
 BIND_BEGIN = f"-- BEGIN {MARKER}"
 BIND_END = f"-- END {MARKER}"
-BIND_BODY = 'o.bind("SUPER + U", "Toggle drop-down terminal", "omarchy-dropdown-terminal toggle")'
+# The keybind must not go through PATH: Omarchy's o.bind turns a string dispatcher
+# into hl.dsp.exec_cmd, i.e. a shell command, which would be resolved by the
+# compositor's PATH - a writable earlier entry would shadow it. The installer also
+# symlinks the CLI into ~/.local/bin, so that absolute path is stable.
+CLI_CMD = os.path.join(HOME, ".local", "bin", "omarchy-dropdown-terminal") if HOME else ""
+BIND_BODY = (
+    f'o.bind("SUPER + U", "Toggle drop-down terminal", "{CLI_CMD} toggle")'
+)
 BIND_LINE = f"{BIND_BEGIN}\n{BIND_BODY}\n{BIND_END}\n"
 BIND_TAG = "Toggle drop-down terminal"
 
@@ -288,8 +320,10 @@ def _locked(path):
 
     Created 0600 with O_NOFOLLOW (a symlink planted at the lock path would
     otherwise let the plugin open and lock an arbitrary file the user owns) and
-    O_CLOEXEC so no spawned child inherits the descriptor.
+    O_CLOEXEC so no spawned child inherits the descriptor. Guarded like every other
+    write, so an unusable HOME cannot create a relative lock file in the cwd.
     """
+    _require_safe_write_target(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -308,7 +342,7 @@ def _locked(path):
 
 def atomic_write(path, content, mode=0o644):
     """Write content to path atomically; preserve existing mode/ownership."""
-    _require_under_home(path)
+    _require_safe_write_target(path)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".ddterm-")
@@ -420,15 +454,12 @@ def install_unit(foot=None):
     existing = read_text(UNIT_DST_PATH)
     if existing is not None and MARKER not in existing:
         backup = UNIT_DST_PATH + ".pre-dropdown-terminal.bak"
-        if not os.path.exists(backup):
-            with open(UNIT_DST_PATH, "rb") as src:
-                data = src.read(MAX_CONFIG_BYTES + 1)
-            if len(data) > MAX_CONFIG_BYTES:
-                print(f"refusing to back up {UNIT_DST_PATH}: over {MAX_CONFIG_BYTES} bytes")
-            else:
-                with open(backup, "wb") as dst:
-                    dst.write(data)
-                print(f"backed up existing {UNIT_DST_PATH} -> {backup}")
+        # atomic_write (mkstemp + replace) rather than open(..., "wb"): a plantable
+        # symlink at the backup path must be replaced, not followed to a file of
+        # someone else's choosing. read_text already bounded and validated the source.
+        if not os.path.exists(backup) or os.path.islink(backup):
+            atomic_write(backup, existing)
+            print(f"backed up existing {UNIT_DST_PATH} -> {backup}")
     atomic_write(UNIT_DST_PATH, unit_body(foot))
     _call("systemctl", "--user", "daemon-reload")
     return True
@@ -442,6 +473,13 @@ def enable_server():
 def install(quiet=False):
     results = {}
     require_home()
+
+    # 0a. Read (and therefore validate) every file we are about to modify BEFORE
+    #     writing anything: an unreadable or oversized config aborts the install with
+    #     nothing half-applied - including this plugin's own rules file, which used to
+    #     be written before the check.
+    for path in (UNIT_DST_PATH, HYPRLAND_LUA, BINDINGS_LUA):
+        read_text(path)
 
     # 0. The plugin's own executables are pinned by absolute shebang and the
     #    generated unit will use the resolved foot path, so verify those
@@ -500,6 +538,12 @@ def install(quiet=False):
 def uninstall():
     results = {}
     require_home()
+
+    # Validate the configs BEFORE touching systemd: an unreadable file must not leave
+    # the unit disabled+masked with our keybind block still installed and no way to
+    # retry (the previous order disabled the unit first and then raised).
+    for path in (UNIT_DST_PATH, HYPRLAND_LUA, BINDINGS_LUA, RULES_PATH):
+        read_text(path)
 
     # 1. Stop + disable the server (ordered to defeat Restart respawn).
     _call("systemctl", "--user", "disable", "--now", UNIT_REF)
@@ -609,6 +653,19 @@ def status():
     return out
 
 
+def _validated_runtime(ancestor_uids=None, prefer_systemd=False):
+    """The runtime directory from the single validator, or a loud failure."""
+    import focus_watcher  # sibling module: owns the runtime-dir validation
+
+    runtime = focus_watcher.runtime_dir(ancestor_uids, prefer_systemd)
+    if runtime is None:
+        raise SystemExit(
+            "no safe runtime directory (need an absolute, self-owned dir with no "
+            "group/other bits, ancestors not writable by others, and not HOME)"
+        )
+    return runtime
+
+
 def runtime_paths(ancestor_uids=None):
     """The validated runtime directory and the state file inside it.
 
@@ -616,29 +673,23 @@ def runtime_paths(ancestor_uids=None):
     the state file the widget watches) both ask here instead of re-implementing the
     rules, so the three consumers cannot disagree about which directory is safe.
     `ancestor_uids` is only for tests (see focus_watcher._ancestors_safe).
-    Raises SystemExit when no safe directory exists.
     """
     import focus_watcher  # sibling module: owns the runtime-dir validation
 
-    runtime = focus_watcher.runtime_dir(ancestor_uids)
-    if runtime is None:
-        raise SystemExit(
-            "no safe runtime directory (need an absolute, self-owned dir with no "
-            "group/other bits, ancestors not writable by others, and not HOME)"
-        )
+    runtime = _validated_runtime(ancestor_uids)
     return runtime, os.path.join(runtime, focus_watcher.STATE_NAME)
 
 
 def socket_path(ancestor_uids=None):
-    """The foot client socket path, in the validated runtime directory.
+    """The foot client socket path, in the directory the UNIT actually binds.
 
-    The name must stay in step with the systemd unit, which binds
-    `--server=%t/foot-%i.sock` for instance `dropdown-terminal` - i.e.
-    `<runtime>/foot-dropdown-terminal.sock`. Deriving it here (instead of in the
-    CLI) keeps the directory rules and the filename in one place; a test asserts the
-    two agree.
+    The socket name must stay in step with `--server=%t/foot-%i.sock` for instance
+    `dropdown-terminal`, and the DIRECTORY must be systemd's %t - the user manager's
+    runtime directory - which does not follow this process's XDG_RUNTIME_DIR. Both
+    are derived here so the CLI, the unit and the widget cannot disagree.
     """
-    return os.path.join(runtime_paths(ancestor_uids)[0], FOOT_SOCKET_NAME)
+    runtime = _validated_runtime(ancestor_uids, prefer_systemd=True)
+    return os.path.join(runtime, FOOT_SOCKET_NAME)
 
 
 # ----------------------------------------------------------------------- main
@@ -646,6 +697,15 @@ def socket_path(ancestor_uids=None):
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    try:
+        dispatch(cmd)
+    except ConfigUnreadable as exc:
+        # A single clean line, not a traceback: this is a user-facing condition.
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def dispatch(cmd):
     if cmd == "install":
         install()
     elif cmd == "uninstall":

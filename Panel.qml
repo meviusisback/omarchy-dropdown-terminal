@@ -160,7 +160,13 @@ Panel {
     interval: 30000
     repeat: true
     running: root.stateFile === "" || !root.stateFileSeen
-    onTriggered: root.refresh()
+    onTriggered: {
+      // Keep trying to learn the path: the first query can fail if it runs before
+      // the runtime directory exists, and without a retry the widget would poll the
+      // CLI for the rest of the session.
+      if (root.stateFile === "") statePathProc.running = true
+      root.refresh()
+    }
   }
 
   // ---------------- IPC ----------------

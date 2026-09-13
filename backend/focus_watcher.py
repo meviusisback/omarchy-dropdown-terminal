@@ -190,7 +190,7 @@ def home_dir():
     return None
 
 
-def runtime_dir(ancestor_uids=None):
+def runtime_dir(ancestor_uids=None, prefer_systemd=False):
     """The session runtime directory, or None when nothing acceptable exists.
 
     Enforced exactly: an absolute, existing directory owned by this user with no
@@ -201,9 +201,18 @@ def runtime_dir(ancestor_uids=None):
     per-user path is accepted as the fallback because it satisfies the same rules.
     This is the single implementation of that rule: the CLI and the widget ask the
     backend for the path instead of repeating it.
+
+    `prefer_systemd` puts /run/user/<uid> first: that is systemd's %t, which is what
+    the foot server unit binds as its socket directory, so a caller that must agree
+    with the unit uses it (the two can differ when XDG_RUNTIME_DIR is set to some
+    other qualifying directory).
     """
     home = home_dir()
-    for candidate in (os.environ.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}"):
+    systemd_dir = f"/run/user/{os.getuid()}"
+    candidates = (systemd_dir, os.environ.get("XDG_RUNTIME_DIR"))
+    if not prefer_systemd:
+        candidates = tuple(reversed(candidates))
+    for candidate in candidates:
         if not candidate or not os.path.isabs(candidate):
             continue
         real = os.path.realpath(candidate)
@@ -335,12 +344,19 @@ def is_visible(hyprctl):
         monitors = json.loads(result.stdout)
     except (json.JSONDecodeError, AttributeError, TypeError):
         return None
-    if not isinstance(monitors, list) or not monitors:
+    if not isinstance(monitors, list):
         return None
+    if not monitors:
+        return False      # a live compositor with no monitors has nothing shown
     if not all(isinstance(monitor, dict) for monitor in monitors):
         return None       # a malformed entry means the payload cannot be trusted
     for monitor in monitors:
-        name = ((monitor.get("specialWorkspace") or {}).get("name")) or ""
+        workspace = monitor.get("specialWorkspace")
+        if workspace is not None and not isinstance(workspace, dict):
+            return None   # nested shape is wrong: no information, not "hidden"
+        name = (workspace or {}).get("name") or ""
+        if not isinstance(name, str):
+            return None
         if name == SPECIAL_WS:
             return True
     return False

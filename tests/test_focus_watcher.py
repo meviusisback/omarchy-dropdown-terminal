@@ -271,10 +271,19 @@ class ToolCallGuardTest(unittest.TestCase):
     def test_parseable_but_wrong_shape_is_no_information(self):
         # "null"/"5" are valid JSON and were iterated straight into a TypeError that
         # killed the watcher; {} and [1,2] were folded back into the "hidden"
-        # sentinel this code exists to avoid.
-        for payload in ("null", "5", "true", "{}", '{"a": 1}', "[1, 2]", "[null]"):
+        # sentinel this code exists to avoid. The nested field must be checked too:
+        # a truthy non-dict specialWorkspace used to raise AttributeError.
+        for payload in ("null", "5", "true", "{}", '{"a": 1}', "[1, 2]", "[null]",
+                        '[{"specialWorkspace": 5}]', '[{"specialWorkspace": "x"}]',
+                        '[{"specialWorkspace": []}]', '[{"specialWorkspace": 1.5}]'):
             self._run_returns(watcher_mod.proc.Result(0, payload, ""))
             self.assertIsNone(watcher_mod.is_visible("/usr/bin/hyprctl"), payload)
+
+    def test_empty_monitor_list_is_hidden_not_unknown(self):
+        # A well-formed but empty list is a compositor with nothing shown, not a
+        # failed probe: folding it into None would stop the state file updating.
+        self._run_returns(watcher_mod.proc.Result(0, "[]", ""))
+        self.assertFalse(watcher_mod.is_visible("/usr/bin/hyprctl"))
 
     def test_poll_tick_never_hides_on_a_failed_probe(self):
         # Regression: the degraded tick used to feed the empty-string sentinel as a

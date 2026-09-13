@@ -153,9 +153,9 @@ your regular foot windows are untouched.
   side: the widget asks the CLI (`state-path`), the CLI asks the backend, and the
   backend validates the directory once for all three consumers (absolute, owned by
   you, no group/other bits, ancestors not writable by others, and not `$HOME`). The
-  same query answers the foot client socket path (`socket-path`) and the watcher's
-  state file, so the directory rules and both filenames live in one place and
-  cannot drift apart.
+  same query answers the foot client socket path (`socket-path`) - in systemd's
+  `%t`, which is what the server unit binds - so the directory rules and both
+  filenames live in one place and cannot drift apart.
   If no directory qualifies, the systemd path is used when it passes the same
   rules, and otherwise the widget reconciles against the CLI every 30 s instead of
   showing a stale icon.
@@ -170,14 +170,16 @@ your regular foot windows are untouched.
   another user, group/world-writable, not a regular file, or reached through a
   directory chain that is not equally trusted. The CLI and the watcher are started
   with a cleared environment and **no `PATH` at all**, so a malicious earlier entry
-  cannot be launched by enabling the widget - there is nothing to look up. The one
-  hard-coded path is `/usr/bin/env`, which runs the watcher with that cleared
-  environment (`-i`, only the variables it needs) and an isolated interpreter
-  (`-I -E -S`); something must be the first exec, so it stops at a root-owned
-  system path. Python-side children get an environment allowlist plus a `PATH`
-  built only from directories that actually validate, and captured output is
-  capped at 256 KiB with the process group killed on overflow or timeout and then
-  reaped.
+  cannot be launched by enabling the widget - there is nothing to look up. The
+  installed keybind also calls the CLI by its absolute `~/.local/bin` path, because
+  Omarchy turns a string dispatcher into a shell command (`hl.dsp.exec_cmd`); the
+  one hard-coded path in the automatic path is `/usr/bin/env`, which runs the
+  watcher with that cleared environment (`-i`, only the variables it needs) and an
+  isolated interpreter (`-I -E -S`). Something must be the first exec, so it stops
+  at a root-owned system path. Python-side children get an environment allowlist
+  plus a `PATH` built only from directories that actually validate, and captured
+  output is capped at 256 KiB with the process group killed on overflow or timeout
+  and then reaped.
 - The focus watcher subscribes to Hyprland's event socket instead of polling
   (idle cost is one liveness round trip per minute, versus ~430k `hyprctl` spawns
   per day when polled at 5 Hz). If the socket is missing, stale or silent, it
@@ -215,9 +217,9 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 30 - config writes, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 35 - config writes, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
-python3 tests/test_focus_watcher.py  # 37 - event state machine, path validation, state file, socket
+python3 tests/test_focus_watcher.py  # 38 - event state machine, path validation, state file, socket
 ```
 
 ## License

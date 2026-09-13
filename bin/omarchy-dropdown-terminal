@@ -31,12 +31,12 @@ READLINK_BIN=/usr/bin/readlink
 [ -x "$READLINK_BIN" ] || READLINK_BIN=/bin/readlink
 [ -x "$READLINK_BIN" ] || { printf 'Error: no usable readlink binary\n' >&2; exit 1; }
 
-# The real uid comes from the kernel: bash's $UID is a variable, so `env UID=0`
-# would otherwise choose which runtime directory (and socket) we act on. If /proc is
-# unavailable, fall back to $UID rather than refusing to run at all - `close` (the
-# watcher's automatic hide path) must keep working.
+# The real uid comes from the kernel, never from the environment: bash imports $UID
+# from the environment (so `env UID=0` would otherwise choose which socket we accept
+# as ours), and no fallback is used here - the paths that compare against REAL_UID
+# fail closed when it is empty, while `close` (the watcher's automatic hide path)
+# does not need it at all.
 REAL_UID="$("$STAT_BIN" -L -c '%u' -- /proc/self 2>/dev/null)" || REAL_UID=""
-[ -n "$REAL_UID" ] || REAL_UID="${UID:-}"
 
 # 0 when $1 is a root-owned directory that group/others cannot write, walking up
 # to / — an attacker-writable directory in the chain would void the check.
@@ -128,31 +128,55 @@ ensure_server() {
     done
     die "foot server ($UNIT) failed to start"
   fi
+  # The unit sets NonBlocking=true, so is-active can be true before foot has bound
+  # its socket. Wait for the socket itself (-S is a kernel test, not parsing output):
+  # a client spawned in that window would be handed a path that does not exist yet and
+  # footclient would exit without retrying.
+  local sock attempt
+  sock="$(server_socket)"
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S "$sock" ] && return 0
+    "$SLEEP" 0.2
+  done
+  return 0    # let spawn_client's guard report precisely what is wrong
 }
 
-# Exit 0 if the special workspace "special:dropdown" is currently shown.
-dropdown_visible() {
-  "$HYPRCTL" monitors -j | "$PYTHON" -c '
+# Exit 0 = "special:dropdown" is shown, 1 = hidden, 3 = the compositor answered
+# something unusable. A failed probe must not be read as "hidden": that would toggle
+# the workspace the wrong way on the next open/close.
+dropdown_probe() {
+  "$HYPRCTL" monitors -j | "$PYTHON" -I -E -S -c '
 import json, sys
 MAX = 262144
 raw = sys.stdin.buffer.read(MAX + 1)
 if len(raw) > MAX:
-    sys.exit(1)                      # over the cap: fail rather than parse a truncated document
+    sys.exit(3)
 try:
-    data = json.loads(raw) if raw else []
+    data = json.loads(raw)
 except (json.JSONDecodeError, TypeError):
-    sys.exit(1)
+    sys.exit(3)
+if not isinstance(data, list):
+    sys.exit(3)
 for m in data:
-    name = ((m.get("specialWorkspace") or {}).get("name") or "")
+    if not isinstance(m, dict):
+        sys.exit(3)
+    sp = m.get("specialWorkspace")
+    if sp is not None and not isinstance(sp, dict):
+        sys.exit(3)
+    name = (sp.get("name") or "") if isinstance(sp, dict) else ""
+    if not isinstance(name, str):
+        sys.exit(3)
     if name.endswith("dropdown"):
         sys.exit(0)
 sys.exit(1)
 '
 }
 
+dropdown_visible() { dropdown_probe; }
+
 # Count clients of the dropdown foot window.
 client_count() {
-  "$HYPRCTL" clients -j | "$PYTHON" -c '
+  "$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
 import json, sys
 MAX = 262144
 raw = sys.stdin.buffer.read(MAX + 1)
@@ -176,7 +200,7 @@ print(n)
 # from the backend (focus_watcher.runtime_dir + FOOT_SOCKET_NAME, the name the unit
 # binds as %t/foot-%i.sock), so the CLI, the watcher and the widget cannot disagree.
 server_socket() {
-  "$PYTHON" -I -E -S "$BACKEND" socket-path || die "no safe runtime directory for the foot socket"
+  run_backend socket-path || die "no safe runtime directory for the foot socket"
 }
 
 spawn_client() {
@@ -185,25 +209,29 @@ spawn_client() {
   # first summon must spawn one; later summons reuse the existing window.
   # setsid detaches it into its own session on purpose, so the session
   # survives this CLI exiting.
-  local sock
+  local sock st mode uid
   sock="$(server_socket)"
-  # If something is already bound there it must be a socket of ours: attaching to
-  # a socket someone else bound would hand them the session's keystrokes.
-  if [ -e "$sock" ]; then
-    local st
-    st="$("$STAT_BIN" -L -c '%F %u' -- "$sock" 2>/dev/null)" || die "cannot inspect $sock"
-    case "$st" in
-      socket\ *) ;;
-      *) die "refusing to use $sock: not a socket" ;;
-    esac
-    [ "${st##* }" = "$REAL_UID" ] || die "refusing to use $sock: it is not ours"
+  # If something is already bound there it must be a real socket of ours: attaching to
+  # a socket someone else bound would hand them the session's keystrokes. The type test
+  # reads the MODE BITS (%f, hexadecimal) because `stat -c %F` returns a TRANSLATED
+  # string ("Socket" under de_DE and 45 other locales), which would make this guard
+  # reject the real socket.
+  [ -n "$REAL_UID" ] || die "cannot determine the real uid (needed to verify the socket)"
+  if [ -e "$sock" ] || [ -L "$sock" ]; then
+    if [ -L "$sock" ]; then die "refusing to use $sock: it is a symlink"; fi
+    st="$("$STAT_BIN" -c '%f %u' -- "$sock" 2>/dev/null)" || die "cannot inspect $sock"
+    mode="${st%% *}"; uid="${st##* }"
+    if [ "$(( 16#$mode & 16#f000 ))" -ne "$(( 16#c000 ))" ]; then
+      die "refusing to use $sock: not a socket"
+    fi
+    [ "$uid" = "$REAL_UID" ] || die "refusing to use $sock: it is not ours"
   fi
   "$SETSID" "$FOOTCLIENT" --server-socket="$sock" >/dev/null 2>&1 &
   disown || true
 }
 
 window_in_special() {
-  "$HYPRCTL" clients -j | "$PYTHON" -c '
+  "$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
 import json, sys
 MAX = 262144
 raw = sys.stdin.buffer.read(MAX + 1)
@@ -223,7 +251,7 @@ sys.exit(1)
 
 # Exit 0 if the dropdown window is the active window.
 active_is_dropdown() {
-  "$HYPRCTL" activewindow -j | "$PYTHON" -c '
+  "$HYPRCTL" activewindow -j | "$PYTHON" -I -E -S -c '
 import json, sys
 MAX = 262144
 raw = sys.stdin.buffer.read(MAX + 1)
@@ -239,7 +267,7 @@ sys.exit(0 if (d or {}).get("class") == "org.omarchy.dropdown-terminal" else 1)
 
 # Print "ADDRESS PINNED" for the first dropdown window ("" if none).
 dropdown_pin_state() {
-  "$HYPRCTL" clients -j | "$PYTHON" -c '
+  "$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
 import json, sys
 MAX = 262144
 raw = sys.stdin.buffer.read(MAX + 1)
@@ -289,7 +317,12 @@ do_open() {
   ensure_server
   # Show the special workspace FIRST so a fresh client's workspace rule has
   # a visible target (spawning while it is hidden is what stranded windows).
-  if ! dropdown_visible; then
+  local probe=0
+  dropdown_probe || probe=$?
+  if [ "$probe" = "3" ]; then
+    die "cannot read the compositor state (unusable monitor list); refusing to toggle"
+  fi
+  if [ "$probe" = "1" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
     "$SLEEP" 0.2
   fi
@@ -309,7 +342,9 @@ do_open() {
     pull_window_into_special || true
   fi
   # Show it once it is where it belongs (guarded against double-toggle).
-  if window_in_special && ! dropdown_visible; then
+  probe=0
+  dropdown_probe || probe=$?
+  if [ "$probe" != "3" ] && window_in_special && [ "$probe" = "1" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
@@ -320,7 +355,12 @@ do_close() {
   if [[ "$(client_count)" -ge 1 ]] && ! window_in_special; then
     pull_window_into_special || true
   fi
-  if dropdown_visible; then
+  local probe=0
+  dropdown_probe || probe=$?
+  if [ "$probe" = "3" ]; then
+    die "cannot read the compositor state (unusable monitor list); refusing to toggle"
+  fi
+  if [ "$probe" = "0" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
@@ -359,6 +399,7 @@ validate_home() {
     *) die "HOME must be an absolute path (got '${home}')" ;;
   esac
   [ -d "$home" ] || die "HOME is not a directory: $home"
+  [ -n "$REAL_UID" ] || die "cannot determine the real uid (needed to verify HOME)"
   st="$("$STAT_BIN" -L -c '%u' -- "$home" 2>/dev/null)" || die "cannot stat HOME: $home"
   uid="$st"
   [ "$uid" = "$REAL_UID" ] || die "HOME is not owned by this user: $home"
