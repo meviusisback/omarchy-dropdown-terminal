@@ -48,6 +48,7 @@ Panel {
   Process {
     id: statePathProc
     command: root.cliArgv(["state-path"])
+    running: true
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

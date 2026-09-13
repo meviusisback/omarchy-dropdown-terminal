@@ -325,7 +325,8 @@ def is_visible(hyprctl):
 
     None must not be folded into False: "no information" and "hidden" lead to
     different actions in the caller (one is a skipped tick, the other can hide the
-    terminal out from under the user).
+    terminal out from under the user). Parseable JSON of the wrong shape counts as
+    no information too, so it is validated before use.
     """
     result = run_tool([hyprctl, "monitors", "-j"])
     if result.returncode != 0:
@@ -334,11 +335,12 @@ def is_visible(hyprctl):
         monitors = json.loads(result.stdout)
     except (json.JSONDecodeError, AttributeError, TypeError):
         return None
+    if not isinstance(monitors, list) or not monitors:
+        return None
+    if not all(isinstance(monitor, dict) for monitor in monitors):
+        return None       # a malformed entry means the payload cannot be trusted
     for monitor in monitors:
-        try:
-            name = ((monitor.get("specialWorkspace") or {}).get("name")) or ""
-        except AttributeError:
-            continue
+        name = ((monitor.get("specialWorkspace") or {}).get("name")) or ""
         if name == SPECIAL_WS:
             return True
     return False
@@ -380,10 +382,13 @@ def event_loop(watcher, state_path, hyprctl, rt):
         if path is None:
             log("no trusted event socket available; leaving the event path")
             return
+        connection = None
         try:
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.connect(path)  # blocking: an idle watcher is never woken
         except OSError as exc:
+            if connection is not None:
+                connection.close()
             failures += 1
             log(f"event socket connect failed ({exc}); attempt {failures}")
             if failures >= 3:
@@ -407,8 +412,10 @@ def event_loop(watcher, state_path, hyprctl, rt):
                 except socket.timeout:
                     # A socket that accepts but never delivers (hung compositor,
                     # half-open connection) must not park the watcher forever: probe
-                    # the compositor once a minute and fall back to polling if the
-                    # round trip fails. Idle cost is this one probe per minute.
+                    # the compositor once a minute and reconnect. Polling cannot help
+                    # here - the poller asks the same hyprctl - so this only re-arms
+                    # the subscription; main() uses poll_loop when the socket itself
+                    # is gone or refuses connections.
                     if not compositor_alive(hyprctl):
                         log("event socket silent and the compositor is not answering")
                         break

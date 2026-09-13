@@ -36,17 +36,20 @@ import proc  # noqa: E402  (sibling module: trusted plugin code)
 
 
 def _validated_home():
-    """The user's home directory, or a loud failure.
+    """The user's home directory, or None when it cannot be established safely.
 
-    Every path this backend writes derives from HOME, so an empty or relative
-    value would scatter config into the filesystem root or the current directory.
-    Accept only an absolute, existing directory owned by this user; otherwise fall
-    back to the passwd entry, and refuse to guess.
+    Every path this backend writes derives from HOME, so an empty or relative value
+    would scatter config into the filesystem root or the cwd. Accept only an
+    absolute, existing directory owned by this user; otherwise fall back to the
+    passwd entry. Callers that write must use require_home()/_require_under_home():
+    resolving HOME must NOT gate commands that do not touch it (runtime-dir,
+    socket-path, state-path - the widget asks for those, and the watcher tolerates
+    an unusable HOME, so failing here would make the two disagree).
     """
     candidates = [os.environ.get("HOME", "")]
     try:
         candidates.append(pwd.getpwuid(os.getuid()).pw_dir)
-    except KeyError:  # pragma: no cover - uid without a passwd entry
+    except KeyError:  # pragma: no cover
         pass
     for candidate in candidates:
         if not candidate or not os.path.isabs(candidate):
@@ -57,12 +60,31 @@ def _validated_home():
             continue
         if stat_module.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
             return candidate.rstrip("/") or "/"
-    raise SystemExit(
-        "cannot determine a safe HOME (unset, relative, missing, or not owned by this user)"
-    )
+    return None
 
 
-HOME = _validated_home()
+HOME = _validated_home() or ""
+
+
+def require_home():
+    """The validated home directory, or a loud failure for commands that need it."""
+    if not HOME:
+        raise SystemExit(
+            "cannot determine a safe HOME (unset, relative, missing, or not owned by "
+            "this user): refusing to write any config"
+        )
+    return HOME
+
+
+def _require_under_home(path):
+    """Guard every write: nothing may land outside a validated HOME.
+
+    Belt and braces for the case where HOME was unusable at import time and the
+    module-level paths below therefore point nowhere useful.
+    """
+    home = require_home()
+    if not os.path.isabs(path) or not path.startswith(home + os.sep):
+        raise SystemExit(f"refusing to write {path!r}: outside {home}")
 
 # Ceiling for reading our own config files; see read_text().
 MAX_CONFIG_BYTES = 1 << 20
@@ -82,6 +104,10 @@ UNIT_SRC_NAME = "foot-server@.service"
 UNIT_DST_PATH = os.path.join(SYSTEMD_USER_DIR, UNIT_SRC_NAME)
 UNIT_INSTANCE = "dropdown-terminal"
 UNIT_REF = f"foot-server@{UNIT_INSTANCE}.service"
+# The unit binds `--server=%t/foot-%i.sock`; with our instance that is this name.
+# Kept as a constant so the CLI's socket path and the unit cannot drift apart
+# (a test substitutes UNIT_INSTANCE into the unit template and compares).
+FOOT_SOCKET_NAME = f"foot-{UNIT_INSTANCE}.sock"
 
 DROPDOWN_APP_ID = "org.omarchy.dropdown-terminal"
 DROPDOWN_WS = "dropdown"
@@ -247,7 +273,9 @@ def _call(name, *args, timeout=10):
 
 
 def _run(argv, timeout=10):
-    """Run an argv array whose argv[0] is already an absolute path. Never raises."""
+    """Legacy argv-array entry point. Unused by the plugin itself: proc.run() is
+    the single execution path (kept only so an out-of-tree caller cannot crash on
+    a missing symbol)."""
     try:
         return proc.run(argv, timeout=timeout)
     except (ValueError, OSError, proc.ToolNotFound) as exc:
@@ -280,6 +308,7 @@ def _locked(path):
 
 def atomic_write(path, content, mode=0o644):
     """Write content to path atomically; preserve existing mode/ownership."""
+    _require_under_home(path)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".ddterm-")
@@ -298,21 +327,26 @@ def atomic_write(path, content, mode=0o644):
             os.unlink(tmp_path)
 
 
-def read_text(path, limit=MAX_CONFIG_BYTES):
-    """Read a config file, bounded.
+class ConfigUnreadable(RuntimeError):
+    """A config file exists but cannot be read (or is absurdly large).
 
-    These are files we only ever write ourselves (rules, hook, unit), so the cap is
-    about never letting a runaway or device-backed file (e.g. a planted symlink to
-    /dev/zero) make an automatic install read without bound; an unreadable or
-    oversized file is reported as absent, and the caller regenerates it.
+    Distinct from "absent" on purpose: callers that regenerate a missing file must
+    NOT treat "I could not read it" the same way, or a 2 MiB hyprland.lua would be
+    replaced by our two hook lines. Every such caller fails loudly instead.
     """
+
+
+def read_text(path, limit=MAX_CONFIG_BYTES):
+    """Read a config file. None = absent (safe to create); raises if unreadable."""
     try:
         with open(path, "rb") as handle:
             data = handle.read(limit + 1)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise ConfigUnreadable(f"cannot read {path}: {exc}") from exc
     if len(data) > limit:
-        return None
+        raise ConfigUnreadable(f"{path} is larger than {limit} bytes; refusing to touch it")
     return data.decode("utf-8", "replace")
 
 
@@ -365,6 +399,7 @@ def line_present(path, needle):
 
 def check_keybind_conflict():
     """Warn if SUPER + U is claimed by any other o.bind line outside our block."""
+    require_home()
     content = read_text(BINDINGS_LUA) or ""
     for ln in content.splitlines():
         s = ln.strip()
@@ -406,6 +441,7 @@ def enable_server():
 
 def install(quiet=False):
     results = {}
+    require_home()
 
     # 0. The plugin's own executables are pinned by absolute shebang and the
     #    generated unit will use the resolved foot path, so verify those
@@ -463,6 +499,7 @@ def install(quiet=False):
 
 def uninstall():
     results = {}
+    require_home()
 
     # 1. Stop + disable the server (ordered to defeat Restart respawn).
     _call("systemctl", "--user", "disable", "--now", UNIT_REF)
@@ -592,6 +629,18 @@ def runtime_paths(ancestor_uids=None):
     return runtime, os.path.join(runtime, focus_watcher.STATE_NAME)
 
 
+def socket_path(ancestor_uids=None):
+    """The foot client socket path, in the validated runtime directory.
+
+    The name must stay in step with the systemd unit, which binds
+    `--server=%t/foot-%i.sock` for instance `dropdown-terminal` - i.e.
+    `<runtime>/foot-dropdown-terminal.sock`. Deriving it here (instead of in the
+    CLI) keeps the directory rules and the filename in one place; a test asserts the
+    two agree.
+    """
+    return os.path.join(runtime_paths(ancestor_uids)[0], FOOT_SOCKET_NAME)
+
+
 # ----------------------------------------------------------------------- main
 
 
@@ -607,6 +656,8 @@ def main():
         print(runtime_paths()[0])
     elif cmd == "state-path":
         print(runtime_paths()[1])
+    elif cmd == "socket-path":
+        print(socket_path())
     elif cmd == "check-conflict":
         conflict = check_keybind_conflict()
         print(conflict or "no conflict")

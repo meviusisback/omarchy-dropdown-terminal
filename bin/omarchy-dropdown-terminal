@@ -32,9 +32,11 @@ READLINK_BIN=/usr/bin/readlink
 [ -x "$READLINK_BIN" ] || { printf 'Error: no usable readlink binary\n' >&2; exit 1; }
 
 # The real uid comes from the kernel: bash's $UID is a variable, so `env UID=0`
-# would otherwise choose which runtime directory (and socket) we act on.
+# would otherwise choose which runtime directory (and socket) we act on. If /proc is
+# unavailable, fall back to $UID rather than refusing to run at all - `close` (the
+# watcher's automatic hide path) must keep working.
 REAL_UID="$("$STAT_BIN" -L -c '%u' -- /proc/self 2>/dev/null)" || REAL_UID=""
-[ -n "$REAL_UID" ] || { printf 'Error: cannot determine the real uid\n' >&2; exit 1; }
+[ -n "$REAL_UID" ] || REAL_UID="${UID:-}"
 
 # 0 when $1 is a root-owned directory that group/others cannot write, walking up
 # to / — an attacker-writable directory in the chain would void the check.
@@ -93,6 +95,7 @@ resolve_tools() {
     uninstall)   wanted="hyprctl python3 systemctl rm" ;;
     watcher)     wanted="python3" ;;
     state-path)  wanted="python3" ;;
+    socket-path) wanted="python3" ;;
     *)           wanted="" ;;
   esac
   for name in $wanted; do
@@ -169,12 +172,11 @@ print(n)
 ' 2>/dev/null || echo 0
 }
 
-# The foot client socket path. The rules for what counts as a safe runtime
-# directory live in ONE place - focus_watcher.runtime_dir(), reached through the
-# backend - so the CLI, the watcher and the widget cannot disagree: absolute,
-# owned by the real uid, no group/other bits, safe ancestor chain, never HOME.
+# The foot client socket path. Both the directory rules AND the socket filename come
+# from the backend (focus_watcher.runtime_dir + FOOT_SOCKET_NAME, the name the unit
+# binds as %t/foot-%i.sock), so the CLI, the watcher and the widget cannot disagree.
 server_socket() {
-  "$PYTHON" "$BACKEND" runtime-dir || die "no safe runtime directory for the foot socket"
+  "$PYTHON" -I -E -S "$BACKEND" socket-path || die "no safe runtime directory for the foot socket"
 }
 
 spawn_client() {
@@ -335,8 +337,16 @@ do_kill() {
   "$SYSTEMCTL" --user stop "$UNIT"
 }
 
+# Every backend invocation uses the ISOLATED interpreter: -I ignores PYTHON* env
+# vars, -E ignores environment-based python options, -S skips site-packages. Without
+# this the validator could be steered by the session's PYTHONPATH (sitecustomize),
+# which would let a loaded module choose the directory it "validates".
+run_backend() {
+  "$PYTHON" -I -E -S "$BACKEND" "$@"
+}
+
 do_status() {
-  "$PYTHON" "$BACKEND" status
+  run_backend status
 }
 
 # HOME is needed only by install/uninstall (the ~/.local/bin symlink), and it is
@@ -359,9 +369,9 @@ do_install() {
   # Everything the plugin cannot do for itself: config edits + the user unit.
   local home_dir
   home_dir="$(validate_home)"
-  "$PYTHON" -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$BACKEND" \
+  "$PYTHON" -I -E -S -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$BACKEND" \
     || die "backend failed to compile"
-  "$PYTHON" "$BACKEND" install
+  run_backend install
   "$SYSTEMCTL" --user daemon-reload
   "$SYSTEMCTL" --user enable --now "$UNIT"
   "$MKDIR" -p "$home_dir/.local/bin"
@@ -375,7 +385,7 @@ do_install() {
 do_uninstall() {
   local home_dir
   home_dir="$(validate_home)"
-  "$PYTHON" "$BACKEND" uninstall
+  run_backend uninstall
   "$SYSTEMCTL" --user daemon-reload
   "$RM" -f "$home_dir/.local/bin/omarchy-dropdown-terminal"
   "$HYPRCTL" reload
@@ -385,7 +395,13 @@ do_uninstall() {
 do_state_path() {
   # Internal: the state file the watcher writes / the widget watches. Asking here
   # keeps Panel.qml from repeating (or diverging from) the runtime-dir rules.
-  "$PYTHON" "$BACKEND" state-path
+  run_backend state-path
+}
+
+do_socket_path() {
+  # Internal: the foot client socket path (directory rules + filename, both from
+  # the backend). server_socket() is this plus the "it must be ours" guard.
+  run_backend socket-path
 }
 
 do_watcher() {
@@ -410,6 +426,7 @@ commands:
   uninstall   remove everything the plugin installed
   watcher     internal: run the focus watcher (used by the bar widget)
   state-path  internal: print the validated state-file path (used by the widget)
+  socket-path internal: print the validated foot client socket path
 EOF
   printf '%s\n' "$text"
 }
@@ -426,6 +443,7 @@ main() {
     uninstall) resolve_tools uninstall; do_uninstall ;;
     watcher)   resolve_tools watcher;   do_watcher ;;
     state-path) resolve_tools state-path; do_state_path ;;
+    socket-path) resolve_tools socket-path; do_socket_path ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $cmd (see --help)" ;;
   esac

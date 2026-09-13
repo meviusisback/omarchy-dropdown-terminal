@@ -152,7 +152,10 @@ your regular foot windows are untouched.
   the widget watches that file - no polling. The path is not guessed on either
   side: the widget asks the CLI (`state-path`), the CLI asks the backend, and the
   backend validates the directory once for all three consumers (absolute, owned by
-  you, no group/other bits, ancestors not writable by others, and not `$HOME`).
+  you, no group/other bits, ancestors not writable by others, and not `$HOME`). The
+  same query answers the foot client socket path (`socket-path`) and the watcher's
+  state file, so the directory rules and both filenames live in one place and
+  cannot drift apart.
   If no directory qualifies, the systemd path is used when it passes the same
   rules, and otherwise the widget reconciles against the CLI every 30 s instead of
   showing a stale icon.
@@ -182,6 +185,9 @@ your regular foot windows are untouched.
   accepts a connection again - dismissal never depends on the event path working,
   and a failed probe is never mistaken for the user focusing another window.
 - `omarchy plugin validate .` and the unit tests below cover these guarantees.
+- `install` never overwrites a config file it cannot read: `hyprland.lua` or
+  `bindings.lua` that is unreadable or implausibly large (> 1 MiB) makes it abort
+  with an error instead of replacing your file with this plugin's marker block.
 - The plugin sets three global input options in
   `~/.config/hypr/dropdown-terminal.lua`: `special_fallthrough = true`,
   `follow_mouse = 0` and `float_switch_override_focus = 0`. The last two turn
@@ -209,9 +215,9 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 26 - config writes, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 30 - config writes, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
-python3 tests/test_focus_watcher.py  # 36 - event state machine, path validation, state file, socket
+python3 tests/test_focus_watcher.py  # 37 - event state machine, path validation, state file, socket
 ```
 
 ## License

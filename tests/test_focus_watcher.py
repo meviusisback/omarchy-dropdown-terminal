@@ -268,6 +268,14 @@ class ToolCallGuardTest(unittest.TestCase):
         self._run_returns(watcher_mod.proc.Result(0, json.dumps({"class": "foot"}), ""))
         self.assertEqual(watcher_mod.active_class("/usr/bin/hyprctl"), "foot")
 
+    def test_parseable_but_wrong_shape_is_no_information(self):
+        # "null"/"5" are valid JSON and were iterated straight into a TypeError that
+        # killed the watcher; {} and [1,2] were folded back into the "hidden"
+        # sentinel this code exists to avoid.
+        for payload in ("null", "5", "true", "{}", '{"a": 1}', "[1, 2]", "[null]"):
+            self._run_returns(watcher_mod.proc.Result(0, payload, ""))
+            self.assertIsNone(watcher_mod.is_visible("/usr/bin/hyprctl"), payload)
+
     def test_poll_tick_never_hides_on_a_failed_probe(self):
         # Regression: the degraded tick used to feed the empty-string sentinel as a
         # real activewindow change, so one failed hyprctl call while the terminal was

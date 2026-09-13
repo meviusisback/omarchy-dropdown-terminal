@@ -260,8 +260,8 @@ class BackendTest(unittest.TestCase):
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
             cli = handle.read()
-        self.assertIn('"$PYTHON" "$BACKEND" runtime-dir', cli)
-        self.assertIn('"$PYTHON" "$BACKEND" state-path', cli)
+        self.assertIn('"$PYTHON" -I -E -S "$BACKEND" socket-path', cli)
+        self.assertIn("run_backend state-path", cli)
         self.assertNotIn('/run/user/$UID', cli)      # no second fallback rule
         # the real uid comes from the kernel, not from a settable variable
         self.assertIn("-L -c '%u' -- /proc/self", cli)
@@ -269,12 +269,36 @@ class BackendTest(unittest.TestCase):
         self.assertTrue(runtime.startswith("/"))
         self.assertEqual(state, os.path.join(runtime, "dropdown-terminal.state"))
 
+    def test_oversized_config_is_never_clobbered(self):
+        # read_text() used to report a present-but-unreadable/oversized file as
+        # "absent", and install() then overwrote the user's Hyprland config with our
+        # marker block. It must refuse loudly instead.
+        big = backend.HYPRLAND_LUA
+        os.makedirs(os.path.dirname(big), exist_ok=True)
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        payload = "-- user config\n" + ("x" * (backend.MAX_CONFIG_BYTES + 10))
+        with open(big, "w") as handle:
+            handle.write(payload)
+        with open(backend.BINDINGS_LUA, "w") as handle:
+            handle.write(payload)
+
+        with self.assertRaises(backend.ConfigUnreadable):
+            backend.install(quiet=True)
+        with open(big) as handle:
+            self.assertEqual(handle.read(), payload)      # untouched
+        with open(backend.BINDINGS_LUA) as handle:
+            self.assertEqual(handle.read(), payload)
+
+    def test_missing_config_is_still_absent(self):
+        read = backend.read_text(os.path.join(SANDBOX, "definitely-not-here"))
+        self.assertIsNone(read)
+
     def test_runtime_paths_fails_loudly_without_a_safe_directory(self):
         # No acceptable runtime dir must be an error, not a silent fallback to
         # somewhere a local attacker could plant the state file or the socket.
         with unittest.mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/etc"}):
             with self.assertRaises(SystemExit) as caught:
-                backend.runtime_paths(())   # trust nobody: no candidate can pass
+                backend.runtime_paths(())
         self.assertIn("no safe runtime directory", str(caught.exception))
 
     def test_status_output_is_bounded_and_validated(self):
@@ -328,6 +352,43 @@ class BackendTest(unittest.TestCase):
         self.assertIn('dir_trusted "${real%/*}"', cli)  # resolved path's directory
         self.assertIn("READLINK_BIN", cli)
 
+    def test_socket_path_matches_the_unit_that_binds_it(self):
+        # The CLI used to build "<runtime>/foot-dropdown-terminal.sock" itself and a
+        # refactor dropped the filename: footclient was handed the runtime DIRECTORY
+        # and the new ownership guard then aborted every first summon. Assert the
+        # value (behaviour) and that it still matches the unit's %t/foot-%i.sock.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        sock = backend.socket_path(TEST_UIDS)
+        self.assertTrue(sock.endswith("/foot-dropdown-terminal.sock"), sock)
+        self.assertEqual(os.path.dirname(sock), backend.runtime_paths(TEST_UIDS)[0])
+        unit_bind = "--server=%t/foot-%i.sock".replace("%i", backend.UNIT_INSTANCE)
+        self.assertTrue(sock.endswith("/" + os.path.basename(unit_bind)))
+        self.assertIn("--server=%t/foot-%i.sock", backend.unit_body("/usr/bin/foot"))
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        self.assertIn('"$PYTHON" -I -E -S "$BACKEND" socket-path', cli)
+        self.assertIn("run_backend state-path", cli)
+        # the CLI must ask for the socket FILE, not the directory
+        self.assertNotIn('"$BACKEND" runtime-dir', cli)
+
+    def test_every_panel_process_is_started_and_panel_uses_no_raw_env_path(self):
+        # A Process whose running flag is never set is dead code (that is how the
+        # state-path query shipped inert). Each declared Process id must either set
+        # `running: true` inline or be started by an explicit assignment.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "Panel.qml")) as handle:
+            panel = handle.read()
+        blocks = panel.split("Process {")[1:]
+        self.assertTrue(blocks, "expected Process blocks in Panel.qml")
+        for block in blocks:
+            match = re.search(r"id:\s*(\w+)", block)
+            name = match.group(1) if match else ""
+            self.assertTrue(name, f"Process block without an id: {block[:80]}")
+            started = re.search(r"running:\s*true", block) or re.search(
+                rf"{name}\.running\s*=\s*true", panel
+            )
+            self.assertTrue(started, f"Panel.qml Process '{name}' is never started")
+
     def test_cli_never_invokes_a_tool_by_bare_name(self):
         # The CLI runs with no PATH at all (it is started with a cleared
         # environment), so every tool must go through need()/$VARS. The regex must
@@ -353,6 +414,10 @@ class BackendTest(unittest.TestCase):
         # and the resolver is the single place that decides trust
         self.assertIn("need() {", source)
         self.assertIn("dir_trusted() {", source)
+        # every backend invocation goes through the isolated interpreter
+        bare_backend = re.compile(r'"\$PYTHON"\s+"\$BACKEND"')
+        self.assertIsNone(bare_backend.search(source), "backend run without -I -E -S")
+        self.assertIn('"$PYTHON" -I -E -S "$BACKEND"', source)
 
 
 if __name__ == "__main__":
