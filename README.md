@@ -137,8 +137,9 @@ Hyprland event socket ($XDG_RUNTIME_DIR/hypr/<signature>/.socket2.sock)
 
 The foot server keeps ONE long-lived Wayland client alive. Every dropdown
 summon attaches a `footclient` to it through a dedicated socket
-(`$XDG_RUNTIME_DIR/foot-dropdown-terminal.sock`), so startup is instant and
-the shell session (scrollback, vim, ssh...) persists as long as the server
+(`$XDG_RUNTIME_DIR/foot-dropdown-terminal.sock`, i.e. systemd's `%t` - the user
+manager's runtime directory, which is what the unit binds), so startup is instant
+and the shell session (scrollback, vim, ssh...) persists as long as the server
 does. The dedicated app-id scopes the window rules to this terminal only -
 your regular foot windows are untouched.
 
@@ -217,9 +218,9 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 35 - config writes, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 41 - config writes, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
-python3 tests/test_focus_watcher.py  # 38 - event state machine, path validation, state file, socket
+python3 tests/test_focus_watcher.py  # 39 - event state machine, path validation, state file, socket
 ```
 
 ## License

@@ -252,7 +252,7 @@ def socket_path(rt):
             return None
     path = os.path.join(signature_dir, ".socket2.sock")
     try:
-        st = os.stat(path)
+        st = os.lstat(path)   # the link itself: a symlink here must not be followed
     except OSError:
         return None
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():

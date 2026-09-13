@@ -11,6 +11,7 @@ import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,10 +19,11 @@ import unittest.mock
 
 SANDBOX = tempfile.mkdtemp(prefix="ddt-test-")
 os.environ["HOME"] = SANDBOX
-# XDG_CONFIG_HOME decides where the config lives (Hyprland reads it), so pin it into
-# the sandbox too: without this the suite operates on the developer's real
-# ~/.config (it did, and the read-only sandbox root is what stopped it).
-os.environ["XDG_CONFIG_HOME"] = os.path.join(SANDBOX, ".config")
+# XDG_CONFIG_HOME decides where the config lives (Hyprland reads it), so drop it:
+# it would otherwise point at the developer's REAL config directory (it did, and the
+# read-only sandbox root is what stopped the suite writing there). Falling back to
+# $HOME/.config then keeps every path inside this sandbox.
+os.environ.pop("XDG_CONFIG_HOME", None)
 BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 sys.path.insert(0, BACKEND_DIR)
 
@@ -30,6 +32,19 @@ sys.path.insert(0, BACKEND_DIR)
 TEST_UIDS = (0, os.getuid(), os.stat("/").st_uid)
 
 backend = importlib.import_module("dropdown_terminal")
+
+
+def terminal_run_bash(script):
+    """Run a shell snippet and return its combined output.
+
+    Used to drive the CLI's own functions with stubbed tools, which is how the
+    socket-readiness branch is kept honest (it is dead code if an early return
+    creeps back in).
+    """
+    completed = subprocess.run(
+        ["/usr/bin/bash", "-c", script], capture_output=True, text=True, timeout=60
+    )
+    return completed.stdout + completed.stderr
 
 
 class BackendTest(unittest.TestCase):
@@ -99,7 +114,7 @@ class BackendTest(unittest.TestCase):
 
     def test_bind_block_roundtrip(self):
         backend.atomic_write(backend.BINDINGS_LUA, "-- my binds\n")
-        body = backend.BIND_BODY
+        body = backend.bind_body()
         self.assertTrue(backend.append_block(backend.BINDINGS_LUA, backend.BIND_BEGIN, body, backend.BIND_END))
         content = backend.read_text(backend.BINDINGS_LUA)
         self.assertIn('o.bind("SUPER + U"', content)
@@ -110,7 +125,7 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(backend.read_text(backend.BINDINGS_LUA).count("o.bind("), 1)
 
     def test_remove_block(self):
-        backend.atomic_write(backend.BINDINGS_LUA, "before\n" + backend.BIND_LINE + "after\n")
+        backend.atomic_write(backend.BINDINGS_LUA, "before\n" + backend.bind_line() + "after\n")
         self.assertTrue(backend.remove_block(backend.BINDINGS_LUA, backend.BIND_BEGIN, backend.BIND_END))
         content = backend.read_text(backend.BINDINGS_LUA)
         self.assertIn("before", content)
@@ -161,7 +176,7 @@ class BackendTest(unittest.TestCase):
         self.assertIn("Something else", conflict)
 
     def test_no_conflict_with_own_block(self):
-        backend.atomic_write(backend.BINDINGS_LUA, backend.BIND_LINE)
+        backend.atomic_write(backend.BINDINGS_LUA, backend.bind_line())
         self.assertIsNone(backend.check_keybind_conflict())
 
     def test_atomic_write_preserves_mode(self):
@@ -380,21 +395,29 @@ class BackendTest(unittest.TestCase):
         # Omarchy's o.bind turns a string dispatcher into hl.dsp.exec_cmd, i.e. a
         # shell command resolved through the compositor's PATH.
         self.assertIn(
-            f"{backend.HOME}/.local/bin/omarchy-dropdown-terminal toggle", backend.BIND_BODY
+            f"{backend.HOME}/.local/bin/omarchy-dropdown-terminal toggle", backend.bind_body()
         )
-        self.assertNotIn('"omarchy-dropdown-terminal toggle"', backend.BIND_BODY)
+        self.assertNotIn('"omarchy-dropdown-terminal toggle"', backend.bind_body())
 
     def test_config_dir_follows_xdg_config_home(self):
         # Hyprland (and the Lua hook) find the config through XDG_CONFIG_HOME: writing
-        # to $HOME/.config while it points elsewhere installs rules nobody loads.
+        # to $HOME/.config while it points elsewhere installs rules nobody loads, so the
+        # write commands require it to be valid instead of silently falling back.
         with tempfile.TemporaryDirectory() as tmp:
             with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
-                self.assertEqual(backend._validated_config_dir(), tmp)
+                self.assertEqual(backend._validated_config_dir(TEST_UIDS), tmp)
             with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative/path"}):
-                self.assertEqual(backend._validated_config_dir(), f"{backend.HOME}/.config")
+                self.assertEqual(
+                    backend._validated_config_dir(TEST_UIDS), f"{backend.HOME}/.config"
+                )
             with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/etc"}):
                 # not ours: never write there
-                self.assertEqual(backend._validated_config_dir(), f"{backend.HOME}/.config")
+                self.assertEqual(
+                    backend._validated_config_dir(TEST_UIDS), f"{backend.HOME}/.config"
+                )
+            with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/etc"}):
+                with self.assertRaises(SystemExit):
+                    backend.require_config_dir(TEST_UIDS)
         # the module constants were derived at import from this sandbox
         self.assertTrue(backend.HYPRLAND_DIR.startswith(SANDBOX))
 
@@ -417,6 +440,110 @@ class BackendTest(unittest.TestCase):
         backend.install_unit("/usr/bin/foot")
         self.assertTrue(os.path.isfile(backend.UNIT_DST_PATH + ".pre-dropdown-terminal.bak"))
         self.assertFalse(os.path.lexists(target), "the symlink target was written through")
+
+    def test_ensure_server_waits_for_the_socket_on_the_cold_path(self):
+        # Two review rounds missed this: the socket wait must run on the COLD path
+        # (unit not active at entry), which is exactly where the first client is
+        # spawned. This drives the real function body with stubs - if the early
+        # `return 0` ever comes back, the cold case returns 0 without waiting and this
+        # test fails.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            source = handle.read()
+        start = source.index("ensure_server() {")
+        end = source.index("\n}\n", start) + 3
+        func = source[start:end]
+        script = (
+            "set -uo pipefail\n"
+            "UNIT=foot-server@test.service\n"
+            "SLEEP=/bin/true\n"
+            "STATE=$(mktemp)\n"
+            "DIR=$(mktemp -d)\n"
+            'SOCK="$DIR/s.sock"\n'
+            'SHIM="$DIR/systemctl"\n'
+            'printf \'#!/bin/sh\\nprintf active > "%s"\\n\' "$STATE" > "$SHIM"\n'
+            'chmod +x "$SHIM"\n'
+            'SYSTEMCTL="$SHIM"\n'
+            'server_active() { [ "$(cat "$STATE")" = active ]; }\n'
+            'server_socket() { printf %s "$SOCK"; }\n'
+            'die() { printf "die: %s\\n" "$*" >&2; exit 7; }\n'
+            'sleep() { :; }\n'
+            + func + "\n"
+            # cold path: inactive at entry, and the socket NEVER appears -> must die
+            'printf inactive > "$STATE"\n'
+            'ensure_server || printf "cold_rc=%s\\n" "$?"\n'
+        )
+        cold = terminal_run_bash(script)
+        # The cold path must reach the socket wait and fail there: before the fix it
+        # returned 0 from the is-active loop and printed nothing, so the presence of
+        # this message (and the absence of a success line) is the proof.
+        self.assertIn("socket did not appear", cold, "the cold path skipped the wait")
+        self.assertNotIn("cold_rc=0", cold)
+
+        # warm path: socket present -> success, no die
+        script_warm = script.replace(
+            'printf inactive > "$STATE"', 'printf active > "$STATE"\nprintf x > /dev/null'
+        ).replace(
+            'ensure_server || printf "cold_rc=%s\\n" "$?"',
+            'python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); '
+            's.bind(sys.argv[1])" "$SOCK" 2>/dev/null || touch "$SOCK"\n'
+            'ensure_server; printf "warm_rc=%s\\n" "$?"',
+        )
+        warm = terminal_run_bash(script_warm)
+        self.assertIn("warm_rc=0", warm)
+
+    def test_cli_and_watcher_match_the_same_workspace_exactly(self):
+        # A suffix match (name.endswith("dropdown")) made the CLI report a foreign
+        # workspace (special:xdropdown) as shown while the watcher said hidden.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        self.assertIn('name == "special:dropdown"', cli)
+        self.assertIn('ws == "special:dropdown"', cli)
+        self.assertNotIn('endswith("dropdown")', cli)
+        import focus_watcher
+
+        self.assertEqual(focus_watcher.SPECIAL_WS, "special:dropdown")
+
+    def test_read_text_refuses_a_fifo(self):
+        # A FIFO at a config path makes open() block forever; a byte cap cannot help.
+        fifo = os.path.join(SANDBOX, "fifo.lua")
+        os.mkfifo(fifo)
+        try:
+            with self.assertRaises(backend.ConfigUnreadable):
+                backend.read_text(fifo)
+        finally:
+            os.unlink(fifo)
+
+    def test_atomic_write_replaces_a_foreign_owned_symlink(self):
+        # os.stat (following) made the mode/owner copy chown to the LINK TARGET's
+        # owner and raise; the link must simply be replaced.
+        target = os.path.join(SANDBOX, "foreign-target")
+        with open(target, "w") as handle:
+            handle.write("foreign\n")
+        link = os.path.join(SANDBOX, "link.lua")
+        os.symlink(target, link)
+        backend.atomic_write(link, "ours\n")     # must not raise
+        self.assertFalse(os.path.islink(link))
+        with open(link) as handle:
+            self.assertEqual(handle.read(), "ours\n")
+
+    def test_write_commands_refuse_an_unsafe_xdg_config_home(self):
+        with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/tmp/ddt-unsafe"}):
+            with self.assertRaises(SystemExit) as caught:
+                backend.require_config_dir()
+        self.assertIn("XDG_CONFIG_HOME", str(caught.exception))
+
+    def test_uninstall_unmasks_even_when_a_block_is_corrupt(self):
+        # A half-removed plugin (unit masked, keybind left) could not be retried.
+        os.makedirs(os.path.dirname(backend.BINDINGS_LUA), exist_ok=True)
+        with open(backend.BINDINGS_LUA, "w") as handle:
+            handle.write(backend.BIND_BEGIN + "\n")     # no END line
+        backend.CALLS.clear()
+        backend.uninstall()
+        verbs = [argv[1:3] for argv in backend.CALLS if argv[0].endswith("systemctl")]
+        self.assertIn(["--user", "mask"], verbs)
+        self.assertIn(["--user", "unmask"], verbs)
 
     def test_every_panel_process_is_started_and_panel_uses_no_raw_env_path(self):
         # A Process whose running flag is never set is dead code (that is how the

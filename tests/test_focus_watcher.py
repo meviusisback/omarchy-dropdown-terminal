@@ -218,6 +218,19 @@ class SocketPathTest(unittest.TestCase):
         temp.close()
         self.assertFalse(watcher_mod.can_connect(stale, timeout=0.2))
 
+    def test_socket_path_is_never_a_symlink(self):
+        # lstat, not stat: the CLI rejects a symlink at the foot socket, so the
+        # watcher must not accept one at the event socket either.
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        elsewhere = os.path.join(self.runtime, "real.sock")
+        sock.bind(elsewhere)
+        self.addCleanup(sock.close)
+        sig_dir = os.path.join(self.runtime, "hypr", self.signature)
+        os.makedirs(sig_dir, exist_ok=True)
+        os.symlink(elsewhere, os.path.join(sig_dir, ".socket2.sock"))
+        with _env("HYPRLAND_INSTANCE_SIGNATURE", self.signature):
+            self.assertIsNone(watcher_mod.socket_path(self.runtime))
+
     def test_rejects_symlinked_signature_directory(self):
         # A symlinked component would let the subscription be redirected.
         elsewhere = tempfile.mkdtemp(prefix="ddt-elsewhere-")

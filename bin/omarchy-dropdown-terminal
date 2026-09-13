@@ -123,22 +123,22 @@ ensure_server() {
     "$SYSTEMCTL" --user start "$UNIT"
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
-      if server_active; then return 0; fi
+      if server_active; then break; fi
       "$SLEEP" 0.2
     done
-    die "foot server ($UNIT) failed to start"
+    server_active || die "foot server ($UNIT) failed to start"
   fi
-  # The unit sets NonBlocking=true, so is-active can be true before foot has bound
-  # its socket. Wait for the socket itself (-S is a kernel test, not parsing output):
-  # a client spawned in that window would be handed a path that does not exist yet and
-  # footclient would exit without retrying.
+  # Type=simple means is-active becomes true as soon as the process is started,
+  # before foot has bound its socket, and footclient does NOT retry: a client spawned
+  # in that window dies and the summon fails silently. So wait for the socket itself
+  # on BOTH paths (-S is a kernel test, no output parsing).
   local sock attempt
   sock="$(server_socket)"
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     [ -S "$sock" ] && return 0
     "$SLEEP" 0.2
   done
-  return 0    # let spawn_client's guard report precisely what is wrong
+  die "foot server socket did not appear at $sock"
 }
 
 # Exit 0 = "special:dropdown" is shown, 1 = hidden, 3 = the compositor answered
@@ -166,7 +166,7 @@ for m in data:
     name = (sp.get("name") or "") if isinstance(sp, dict) else ""
     if not isinstance(name, str):
         sys.exit(3)
-    if name.endswith("dropdown"):
+    if name == "special:dropdown":
         sys.exit(0)
 sys.exit(1)
 '
@@ -211,21 +211,21 @@ spawn_client() {
   # survives this CLI exiting.
   local sock st mode uid
   sock="$(server_socket)"
-  # If something is already bound there it must be a real socket of ours: attaching to
-  # a socket someone else bound would hand them the session's keystrokes. The type test
-  # reads the MODE BITS (%f, hexadecimal) because `stat -c %F` returns a TRANSLATED
-  # string ("Socket" under de_DE and 45 other locales), which would make this guard
-  # reject the real socket.
+  # The socket must BE there (ensure_server waited for it) and must be a real socket
+  # of ours: attaching to a socket someone else bound would hand them the session's
+  # keystrokes, and handing footclient a path that is not a socket simply fails
+  # silently. The type test reads the MODE BITS (%f, hexadecimal) because
+  # `stat`'s file-type string is TRANSLATED ("Socket" under de_DE and 45 other
+  # locales), which would make this guard reject the real socket.
   [ -n "$REAL_UID" ] || die "cannot determine the real uid (needed to verify the socket)"
-  if [ -e "$sock" ] || [ -L "$sock" ]; then
-    if [ -L "$sock" ]; then die "refusing to use $sock: it is a symlink"; fi
-    st="$("$STAT_BIN" -c '%f %u' -- "$sock" 2>/dev/null)" || die "cannot inspect $sock"
-    mode="${st%% *}"; uid="${st##* }"
-    if [ "$(( 16#$mode & 16#f000 ))" -ne "$(( 16#c000 ))" ]; then
-      die "refusing to use $sock: not a socket"
-    fi
-    [ "$uid" = "$REAL_UID" ] || die "refusing to use $sock: it is not ours"
+  [ -S "$sock" ] || die "no socket at $sock (the foot server is not listening)"
+  if [ -L "$sock" ]; then die "refusing to use $sock: it is a symlink"; fi
+  st="$("$STAT_BIN" -c '%f %u' -- "$sock" 2>/dev/null)" || die "cannot inspect $sock"
+  mode="${st%% *}"; uid="${st##* }"
+  if [ "$(( 16#$mode & 16#f000 ))" -ne "$(( 16#c000 ))" ]; then
+    die "refusing to use $sock: not a socket"
   fi
+  [ "$uid" = "$REAL_UID" ] || die "refusing to use $sock: it is not ours"
   "$SETSID" "$FOOTCLIENT" --server-socket="$sock" >/dev/null 2>&1 &
   disown || true
 }
@@ -244,7 +244,7 @@ except (json.JSONDecodeError, TypeError):
 for c in data:
     if c.get("class") == "org.omarchy.dropdown-terminal":
         ws = (c.get("workspace") or {}).get("name") or ""
-        sys.exit(0 if ws.startswith("special:") else 1)
+        sys.exit(0 if ws == "special:dropdown" else 1)
 sys.exit(1)
 '
 }
@@ -408,15 +408,20 @@ validate_home() {
 
 do_install() {
   # Everything the plugin cannot do for itself: config edits + the user unit.
-  local home_dir
+  # The ~/.local/bin link comes FIRST: the keybind the backend writes points at it,
+  # and an absolute path that does not exist would make SUPER+U a silent no-op.
+  local home_dir local_bin
   home_dir="$(validate_home)"
+  local_bin="$home_dir/.local/bin/omarchy-dropdown-terminal"
+  [ -e "$local_bin" ] && [ ! -L "$local_bin" ] && die "$local_bin exists and is not a symlink"
+  "$MKDIR" -p "$home_dir/.local/bin" || die "cannot create $home_dir/.local/bin"
+  "$LN" -sfn "$SCRIPT_DIR/omarchy-dropdown-terminal" "$local_bin" || die "cannot link $local_bin"
+  [ -x "$local_bin" ] || die "$local_bin is not executable after linking"
   "$PYTHON" -I -E -S -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$BACKEND" \
     || die "backend failed to compile"
   run_backend install
   "$SYSTEMCTL" --user daemon-reload
   "$SYSTEMCTL" --user enable --now "$UNIT"
-  "$MKDIR" -p "$home_dir/.local/bin"
-  "$LN" -sfn "$SCRIPT_DIR/omarchy-dropdown-terminal" "$home_dir/.local/bin/omarchy-dropdown-terminal"
   "$HYPRCTL" reload
   msg "Installed. Press SUPER + U to drop the terminal."
   msg "Bar widget: $PLUGIN_ID (enable via omarchy plugin enable)."

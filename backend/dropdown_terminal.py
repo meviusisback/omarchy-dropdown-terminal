@@ -76,38 +76,83 @@ def require_home():
     return HOME
 
 
-def _validated_config_dir():
-    """$XDG_CONFIG_HOME when it is absolute and ours, else $HOME/.config.
+def _config_dir_candidate(ancestor_uids=None):
+    """The validated XDG_CONFIG_HOME, or None when it is unset/unusable.
 
-    Hyprland and the Lua hook find the config through XDG_CONFIG_HOME, so writing
-    to $HOME/.config while that variable points elsewhere would install rules the
-    compositor never loads.
+    A directory that does not exist yet is acceptable (a first install creates it) as
+    long as its parent chain is safe; world-writable or foreign-owned candidates are
+    not, because their name could be swapped.
     """
     candidate = os.environ.get("XDG_CONFIG_HOME", "")
-    if candidate and os.path.isabs(candidate):
-        try:
-            st = os.stat(candidate)
-        except OSError:
-            st = None
-        if st is not None and stat_module.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
-            return candidate.rstrip("/")
+    if not candidate or not os.path.isabs(candidate):
+        return None
+    import focus_watcher  # same ancestor rule the runtime dir uses
+
+    real = os.path.realpath(candidate)
+    try:
+        st = os.stat(real)
+    except FileNotFoundError:
+        parent = os.path.dirname(real)
+        if not parent or not os.path.isdir(parent):
+            return None
+        st = os.stat(parent)
+        real = parent
+    except OSError:
+        return None
+    if not stat_module.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        return None
+    if st.st_mode & 0o022:
+        return None      # group/world-writable: its name can be swapped
+    if not focus_watcher._ancestors_safe(real, ancestor_uids or (0, os.getuid())):
+        return None
+    return os.path.realpath(candidate)
+
+
+def _validated_config_dir(ancestor_uids=None):
+    """Where this user's config lives: validated XDG_CONFIG_HOME, else $HOME/.config.
+
+    Hyprland (and the Lua hook) find the config through XDG_CONFIG_HOME, so writing
+    to $HOME/.config while that variable points elsewhere would install rules the
+    compositor never loads. Callers that WRITE use require_config_dir(), which fails
+    loudly instead of silently falling back, so a disagreement cannot be created.
+    """
+    candidate = _config_dir_candidate(ancestor_uids)
+    if candidate:
+        return candidate
     return os.path.join(HOME, ".config") if HOME else ""
+
+
+def require_config_dir(ancestor_uids=None):
+    """The config directory for write commands, or a loud failure."""
+    if os.environ.get("XDG_CONFIG_HOME"):
+        candidate = _config_dir_candidate(ancestor_uids)
+        if candidate is None:
+            raise SystemExit(
+                "XDG_CONFIG_HOME is set but is not an absolute, self-owned directory "
+                "with safe ancestors: refusing to install anywhere the compositor "
+                "would not read"
+            )
+        return candidate
+    return require_home() and os.path.join(HOME, ".config")
 
 
 def _require_safe_write_target(path):
     """Guard every write: inside HOME or the validated config directory.
 
-    Belt and braces for the case where HOME was unusable at import time and the
-    module-level paths below therefore point nowhere useful.
+    Compared on RESOLVED paths, so a symlinked directory component cannot smuggle a
+    write outside those trees, and the write commands additionally require the config
+    directory itself to be the validated one (require_config_dir).
     """
+    require_config_dir()
     allowed = [base for base in (HOME, _validated_config_dir()) if base]
     if not allowed:
         raise SystemExit(
             "cannot determine a safe HOME (unset, relative, missing, or not owned by "
             "this user): refusing to write any config"
         )
+    real = os.path.realpath(path)
     if not os.path.isabs(path) or not any(
-        path.startswith(base + os.sep) for base in allowed
+        real.startswith(os.path.realpath(base) + os.sep) for base in allowed
     ):
         raise SystemExit(f"refusing to write {path!r}: outside {' and '.join(allowed)}")
 
@@ -249,11 +294,43 @@ BIND_END = f"-- END {MARKER}"
 # into hl.dsp.exec_cmd, i.e. a shell command, which would be resolved by the
 # compositor's PATH - a writable earlier entry would shadow it. The installer also
 # symlinks the CLI into ~/.local/bin, so that absolute path is stable.
-CLI_CMD = os.path.join(HOME, ".local", "bin", "omarchy-dropdown-terminal") if HOME else ""
-BIND_BODY = (
-    f'o.bind("SUPER + U", "Toggle drop-down terminal", "{CLI_CMD} toggle")'
-)
-BIND_LINE = f"{BIND_BEGIN}\n{BIND_BODY}\n{BIND_END}\n"
+SAFE_KEYBIND_PATH_RE = re.compile(r"\A/[A-Za-z0-9._+/-]+\Z")
+
+
+def _lua_escape(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def cli_command():
+    """The absolute CLI path for the keybind, or a loud failure.
+
+    The path is interpolated into a Lua string that becomes a shell command, so HOME
+    must not contain anything that could break out of either (a space, quote,
+    backslash, `;`, `$`...). Refusing is better than writing a keybind that is broken
+    or, worse, executes something else.
+    """
+    if not HOME:
+        raise SystemExit("cannot determine a safe HOME: refusing to write the keybind")
+    path = os.path.join(HOME, ".local", "bin", "omarchy-dropdown-terminal")
+    if not SAFE_KEYBIND_PATH_RE.match(path):
+        raise SystemExit(
+            f"HOME cannot be written into a keybind safely ({HOME!r}): it contains "
+            "characters that would need shell/Lua escaping"
+        )
+    return _lua_escape(path)
+
+
+def bind_body():
+    return f'o.bind("SUPER + U", "Toggle drop-down terminal", "{cli_command()} toggle")'
+
+
+def bind_line():
+    """The BEGIN/body/END block. A function, not a constant: it must not resolve HOME
+    at import time (a session with an unusable HOME must still be able to run
+    `runtime-dir`/`socket-path`/`close`)."""
+    return f"{BIND_BEGIN}\n{bind_body()}\n{BIND_END}\n"
+
+
 BIND_TAG = "Toggle drop-down terminal"
 
 # ----------------------------------------------------------------- utilities
@@ -350,11 +427,22 @@ def atomic_write(path, content, mode=0o644):
         with os.fdopen(tmp_fd, "w") as tmp:
             tmp.write(content)
         try:
-            st = os.stat(path)
-            os.chmod(tmp_path, stat_module.S_IMODE(st.st_mode))
-            os.chown(tmp_path, st.st_uid, st.st_gid)
+            # lstat, not stat: a symlink at the write target must be REPLACED by
+            # os.replace, not followed for mode/ownership (following it would chown
+            # to the link target's owner and raise EPERM on a foreign-owned link).
+            st = os.lstat(path)
         except FileNotFoundError:
-            os.chmod(tmp_path, mode)
+            st = None
+        try:
+            if st is not None and not stat_module.S_ISLNK(st.st_mode):
+                os.chmod(tmp_path, stat_module.S_IMODE(st.st_mode))
+                os.chown(tmp_path, st.st_uid, st.st_gid)
+            else:
+                os.chmod(tmp_path, mode)
+        except OSError:
+            # Best effort: the content matters more than preserving a mode we cannot
+            # copy (e.g. a target owned by root).
+            pass
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
@@ -371,12 +459,29 @@ class ConfigUnreadable(RuntimeError):
 
 
 def read_text(path, limit=MAX_CONFIG_BYTES):
-    """Read a config file. None = absent (safe to create); raises if unreadable."""
+    """Read a config file. None = absent (safe to create); raises if unreadable.
+
+    The path must be a regular file (or a symlink TO one): a FIFO or device at a
+    config path would otherwise block an automatic install forever, and a byte cap
+    only bounds regular files.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ConfigUnreadable(f"cannot inspect {path}: {exc}") from exc
+    if not stat_module.S_ISREG(st.st_mode):
+        if stat_module.S_ISLNK(st.st_mode):
+            try:
+                st = os.stat(path)
+            except OSError as exc:
+                raise ConfigUnreadable(f"cannot follow {path}: {exc}") from exc
+        if not stat_module.S_ISREG(st.st_mode):
+            raise ConfigUnreadable(f"{path} is not a regular file; refusing to read it")
     try:
         with open(path, "rb") as handle:
             data = handle.read(limit + 1)
-    except FileNotFoundError:
-        return None
     except OSError as exc:
         raise ConfigUnreadable(f"cannot read {path}: {exc}") from exc
     if len(data) > limit:
@@ -522,7 +627,7 @@ def install(quiet=False):
     if conflict:
         results["keybind"] = f"CONFLICT: SUPER + U already used by: {conflict}"
     else:
-        added = append_block(BINDINGS_LUA, BIND_BEGIN, BIND_BODY, BIND_END)
+        added = append_block(BINDINGS_LUA, BIND_BEGIN, bind_body(), BIND_END)
         results["keybind"] = "added" if added else "already-installed"
 
     # 4. systemd unit (with the validated foot path) + enable.
@@ -555,23 +660,34 @@ def uninstall():
     _call("systemctl", "--user", "mask", UNIT_REF)
     results["unit"] = "stopped+disabled+masked"
 
-    # 2. Remove the keybind block, the hook line, the rules file.
-    results["keybind_removed"] = remove_block(BINDINGS_LUA, BIND_BEGIN, BIND_END)
-    results["hook_removed"] = _remove_hook_line()
+    # 2. Remove the keybind block, the hook line, the rules file. A corrupted marker
+    #    block is reported, not fatal: aborting here would leave the unit masked (step
+    #    3 never runs) and every retry would fail at the same place.
+    try:
+        results["keybind_removed"] = remove_block(BINDINGS_LUA, BIND_BEGIN, BIND_END)
+    except ValueError as exc:
+        results["keybind_removed"] = f"skipped: {exc}"
+    try:
+        results["hook_removed"] = _remove_hook_line()
+    except ValueError as exc:
+        results["hook_removed"] = f"skipped: {exc}"
     try:
         os.unlink(RULES_PATH)
         results["rules_file"] = "removed"
     except FileNotFoundError:
         results["rules_file"] = "absent"
 
-    # 3. Unmask + remove unit file + reload.
-    _call("systemctl", "--user", "unmask", UNIT_REF)
+    # 3. Unmask + remove unit file + reload. In a finally: whatever happened above,
+    #    a masked unit must never survive an uninstall (it would block a reinstall).
     try:
-        os.unlink(UNIT_DST_PATH)
-        results["unit_file"] = "removed"
-    except FileNotFoundError:
-        results["unit_file"] = "absent"
-    _call("systemctl", "--user", "daemon-reload")
+        try:
+            os.unlink(UNIT_DST_PATH)
+            results["unit_file"] = "removed"
+        except FileNotFoundError:
+            results["unit_file"] = "absent"
+    finally:
+        _call("systemctl", "--user", "unmask", UNIT_REF)
+        _call("systemctl", "--user", "daemon-reload")
 
     # The lock file is deliberately NOT removed: unlinking a lock another process
     # may still hold would let a fresh process create a different inode and both
@@ -641,7 +757,7 @@ def status():
         mdata = json.loads(mons) if mons else []
         for m in mdata:
             ws = (m.get("specialWorkspace") or {}).get("name") or ""
-            if ws.endswith(DROPDOWN_WS):
+            if ws == f"special:{DROPDOWN_WS}":
                 out["visible"] = True
                 break
         else:
@@ -683,12 +799,25 @@ def runtime_paths(ancestor_uids=None):
 def socket_path(ancestor_uids=None):
     """The foot client socket path, in the directory the UNIT actually binds.
 
-    The socket name must stay in step with `--server=%t/foot-%i.sock` for instance
-    `dropdown-terminal`, and the DIRECTORY must be systemd's %t - the user manager's
-    runtime directory - which does not follow this process's XDG_RUNTIME_DIR. Both
-    are derived here so the CLI, the unit and the widget cannot disagree.
+    The name must stay in step with `--server=%t/foot-%i.sock` for instance
+    `dropdown-terminal`, and the DIRECTORY must be systemd's %t (/run/user/<uid>),
+    which does not follow this process's XDG_RUNTIME_DIR. If %t cannot be validated
+    the validated XDG_RUNTIME_DIR is used, but loudly: silently dialing a directory
+    the unit never bound would make the terminal fail with no explanation.
     """
-    runtime = _validated_runtime(ancestor_uids, prefer_systemd=True)
+    import focus_watcher
+
+    systemd_dir = f"/run/user/{os.getuid()}"
+    runtime = focus_watcher.runtime_dir(ancestor_uids, prefer_systemd=True)
+    if runtime is None:
+        raise SystemExit("no safe runtime directory for the foot socket")
+    if runtime != systemd_dir:
+        print(
+            f"warning: foot socket in {runtime}, but the unit binds {systemd_dir} "
+            "(systemd %t); if the terminal does not open, XDG_RUNTIME_DIR differs from "
+            "the user manager's runtime directory",
+            file=sys.stderr,
+        )
     return os.path.join(runtime, FOOT_SOCKET_NAME)
 
 
