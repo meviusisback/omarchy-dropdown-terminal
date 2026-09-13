@@ -22,7 +22,9 @@ Panel {
   // Right-click menu open state (drives the PopupCard `open` property).
   property bool menuOpen: false
 
-  // Live state (filled from the CLI's JSON status).
+  // Live state. `visible` comes from the state file the focus watcher publishes
+  // (event-driven); the rest is filled from the CLI's JSON status, which now
+  // runs only on demand - at load, after an action, or when IPC asks.
   property var ddState: ({
     server: "unknown",
     window: null,
@@ -31,6 +33,35 @@ Panel {
     keybind: "SUPER + U"
   })
   property bool busy: false
+
+  // Where the watcher publishes visibility. Only an ABSOLUTE runtime dir is
+  // accepted: an empty or relative value must never become a path at "/".
+  readonly property string stateFile: {
+    const rt = Quickshell.env("XDG_RUNTIME_DIR") || ""
+    return rt.startsWith("/") ? rt + "/dropdown-terminal.state" : ""
+  }
+
+  // Event-driven state: the watcher rewrites this file whenever the dropdown is
+  // shown or hidden, so the icon tracks it with zero idle wakeups. A missing,
+  // oversized or malformed file keeps the previous state, and only the
+  // `visible` boolean is ever read - it is never interpolated into a command.
+  FileView {
+    id: stateFileView
+    path: root.stateFile
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.readState()
+    // text() is stale inside the change signal, so reload() first.
+    onFileChanged: reload()
+  }
+
+  function readState() {
+    try {
+      const parsed = JSON.parse(stateFileView.text() || "{}")
+      if (parsed && typeof parsed === "object" && typeof parsed.visible === "boolean")
+        root.ddState = Object.assign({}, root.ddState, { visible: parsed.visible })
+    } catch (e) { /* malformed or truncated: keep the previous state */ }
+  }
 
   function scriptPath() {
     // bin/ is a sibling of Panel.qml inside the plugin folder.
@@ -76,11 +107,14 @@ Panel {
     }
   }
 
+  // Fallback only: with no absolute XDG_RUNTIME_DIR there is no state file to
+  // watch, so reconcile against the CLI slowly instead of showing a stale icon.
+  // In every normal session this timer is inert - nothing polls on a schedule.
   Timer {
-    id: refreshTimer
-    interval: 5000
+    id: fallbackRefreshTimer
+    interval: 30000
     repeat: true
-    running: true
+    running: root.stateFile === ""
     onTriggered: root.refresh()
   }
 
@@ -169,9 +203,30 @@ Panel {
   }
 
   // ---------------- focus watcher (auto-close special ws when focus leaves) ----------------
+  // Launched by absolute path with a CLEARED environment and an isolated
+  // interpreter, so this automatic process inherits none of the session
+  // environment and nothing can be resolved through PATH: `/usr/bin/env -i`
+  // drops the inherited environment, only the variables the watcher genuinely
+  // needs are passed back explicitly, and `-I -E -S` keeps PYTHON* variables and
+  // site-packages out of the interpreter as well.
   Process {
     id: focusWatcher
-    command: ["python3", Qt.resolvedUrl("backend/focus_watcher.py").toString().replace(/^file:\/\//, "")]
+    command: {
+      const watcher = Qt.resolvedUrl("backend/focus_watcher.py").toString().replace(/^file:\/\//, "")
+      const vars = [
+        "HOME=" + (Quickshell.env("HOME") || ""),
+        "PATH=/usr/bin:/bin:/usr/local/bin"
+      ]
+      const runtimeDir = Quickshell.env("XDG_RUNTIME_DIR") || ""
+      const signature = Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") || ""
+      const display = Quickshell.env("WAYLAND_DISPLAY") || ""
+      if (runtimeDir) vars.push("XDG_RUNTIME_DIR=" + runtimeDir)
+      if (signature) vars.push("HYPRLAND_INSTANCE_SIGNATURE=" + signature)
+      if (display) vars.push("WAYLAND_DISPLAY=" + display)
+      return ["/usr/bin/env", "-i"].concat(vars).concat([
+        "/usr/bin/python3", "-I", "-E", "-S", watcher
+      ])
+    }
     running: true
   }
 

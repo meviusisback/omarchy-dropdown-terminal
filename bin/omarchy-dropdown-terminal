@@ -1,26 +1,106 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # omarchy-dropdown-terminal — control the persistent drop-down terminal.
 # argv-only exec; no eval, no shell=True anywhere.
+#
+# This CLI is started automatically (by the bar widget's keybind, by the focus
+# watcher, and by install.sh) and it may run under a minimal environment with no
+# PATH at all. Every external tool is therefore resolved to a validated absolute
+# path from a fixed candidate list - never through PATH - so a malicious earlier
+# PATH entry cannot be launched just by enabling the widget:
+#   * the candidate directory chain must be root-owned and not group/world-writable
+#   * the tool itself must be root-owned, executable, and not group/world-writable
+# Only /usr/bin/stat (or /bin/stat) is used to judge that, and it is never looked
+# up through PATH.
 set -euo pipefail
 
 PLUGIN_ID="meviusisback.dropdown-terminal"
 APP_ID="org.omarchy.dropdown-terminal"
 UNIT="foot-server@dropdown-terminal.service"
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SCRIPT_DIR="$(cd -- "${BASH_SOURCE[0]%/*}" && pwd -P)"
 BACKEND="$SCRIPT_DIR/../backend/dropdown_terminal.py"
+LOCAL_BIN="$HOME/.local/bin/omarchy-dropdown-terminal"
 
 msg() { printf '%s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-server_active() { systemctl --user is-active --quiet "$UNIT"; }
+# ------------------------------------------------------- trusted tool lookup
+
+STAT_BIN=/usr/bin/stat
+[ -x "$STAT_BIN" ] || STAT_BIN=/bin/stat
+[ -x "$STAT_BIN" ] || { printf 'Error: no usable stat binary\n' >&2; exit 1; }
+
+# 0 when $1 is a root-owned directory that group/others cannot write, walking up
+# to / — an attacker-writable directory in the chain would void the check.
+dir_trusted() {
+  local d="$1" st uid mode
+  while :; do
+    st="$("$STAT_BIN" -L -c '%u %a' -- "$d" 2>/dev/null)" || return 1
+    uid="${st%% *}"; mode="${st##* }"
+    [ "$uid" = "0" ] || return 1
+    (( 8#$mode & 8#022 )) && return 1
+    [ "$d" = "/" ] && return 0
+    d="${d%/*}"; [ -n "$d" ] || d=/
+  done
+}
+
+# Print the trusted absolute path of a tool, or die. Never consults PATH.
+need() {
+  local name="$1" dir cand st uid mode
+  case "$name" in
+    ""|*[!A-Za-z0-9._+-]*) die "invalid tool name: $name" ;;
+  esac
+  for dir in /usr/bin /bin /usr/local/bin; do
+    cand="$dir/$name"
+    [ -x "$cand" ] || continue
+    st="$("$STAT_BIN" -L -c '%u %a' -- "$cand" 2>/dev/null)" || continue
+    uid="${st%% *}"; mode="${st##* }"
+    [ "$uid" = "0" ] || continue
+    (( 8#$mode & 8#022 )) && continue
+    dir_trusted "$dir" || continue
+    printf '%s' "$cand"
+    return 0
+  done
+  die "no trusted $name found (looked in /usr/bin, /bin, /usr/local/bin; must be root-owned and not group/world-writable)"
+}
+
+# Resolve exactly what the requested command needs, once per process.
+resolve_tools() {
+  local wanted name
+  case "$1" in
+    toggle|open) wanted="hyprctl python3 systemctl sleep setsid footclient" ;;
+    close)       wanted="hyprctl python3" ;;
+    kill)        wanted="systemctl" ;;
+    status)      wanted="systemctl hyprctl python3" ;;
+    install)     wanted="foot hyprctl python3 systemctl mkdir ln" ;;
+    uninstall)   wanted="hyprctl python3 systemctl" ;;
+    *)           wanted="" ;;
+  esac
+  for name in $wanted; do
+    case "$name" in
+      python3)    PYTHON="$(need python3)" ;;
+      hyprctl)    HYPRCTL="$(need hyprctl)" ;;
+      systemctl)  SYSTEMCTL="$(need systemctl)" ;;
+      sleep)      SLEEP="$(need sleep)" ;;
+      setsid)     SETSID="$(need setsid)" ;;
+      footclient) FOOTCLIENT="$(need footclient)" ;;
+      foot)       FOOT="$(need foot)" ;;
+      mkdir)      MKDIR="$(need mkdir)" ;;
+      ln)         LN="$(need ln)" ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------ actions
+
+server_active() { "$SYSTEMCTL" --user is-active --quiet "$UNIT"; }
 
 ensure_server() {
   if ! server_active; then
-    systemctl --user start "$UNIT"
+    "$SYSTEMCTL" --user start "$UNIT"
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
       if server_active; then return 0; fi
-      sleep 0.2
+      "$SLEEP" 0.2
     done
     die "foot server ($UNIT) failed to start"
   fi
@@ -28,7 +108,7 @@ ensure_server() {
 
 # Exit 0 if the special workspace "special:dropdown" is currently shown.
 dropdown_visible() {
-  hyprctl monitors -j | python3 -c '
+  "$HYPRCTL" monitors -j | "$PYTHON" -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -44,7 +124,7 @@ sys.exit(1)
 
 # Count clients of the dropdown foot window.
 client_count() {
-  hyprctl clients -j | python3 -c '
+  "$HYPRCTL" clients -j | "$PYTHON" -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -59,22 +139,22 @@ print(n)
 ' 2>/dev/null || echo 0
 }
 
-# ---------------------------------------------------------------- actions
-
 server_socket() {
-  printf '%s/foot-dropdown-terminal.sock' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  printf '%s/foot-dropdown-terminal.sock' "${XDG_RUNTIME_DIR:-/run/user/$UID}"
 }
 
 spawn_client() {
   # footclient attaches to the persistent server and creates the window.
   # The server itself creates no window until a client connects, so the
   # first summon must spawn one; later summons reuse the existing window.
-  setsid footclient --server-socket="$(server_socket)" >/dev/null 2>&1 &
+  # setsid detaches it into its own session on purpose, so the session
+  # survives this CLI exiting.
+  "$SETSID" "$FOOTCLIENT" --server-socket="$(server_socket)" >/dev/null 2>&1 &
   disown || true
 }
 
 window_in_special() {
-  hyprctl clients -j | python3 -c '
+  "$HYPRCTL" clients -j | "$PYTHON" -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -90,7 +170,7 @@ sys.exit(1)
 
 # Exit 0 if the dropdown window is the active window.
 active_is_dropdown() {
-  hyprctl activewindow -j | python3 -c '
+  "$HYPRCTL" activewindow -j | "$PYTHON" -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -102,7 +182,7 @@ sys.exit(0 if (d or {}).get("class") == "org.omarchy.dropdown-terminal" else 1)
 
 # Print "ADDRESS PINNED" for the first dropdown window ("" if none).
 dropdown_pin_state() {
-  hyprctl clients -j | python3 -c '
+  "$HYPRCTL" clients -j | "$PYTHON" -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -120,8 +200,8 @@ unpin_if_pinned() {
   local addr pinned
   read -r addr pinned <<<"$(dropdown_pin_state)"
   if [[ -n "$addr" && "$pinned" == "true" ]]; then
-    hyprctl dispatch "hl.dsp.window.pin(\"$addr\")" >/dev/null 2>&1 || true
-    sleep 0.2
+    "$HYPRCTL" dispatch "hl.dsp.window.pin(\"$addr\")" >/dev/null 2>&1 || true
+    "$SLEEP" 0.2
   fi
 }
 
@@ -132,11 +212,11 @@ pull_window_into_special() {
   # refuses the move. Verifies the result; exits 0 on success.
   active_is_dropdown || return 1
   unpin_if_pinned
-  hyprctl dispatch 'hl.dsp.window.move({ workspace = "special:dropdown" })' >/dev/null 2>&1 || true
+  "$HYPRCTL" dispatch 'hl.dsp.window.move({ workspace = "special:dropdown" })' >/dev/null 2>&1 || true
   local i
   for i in 1 2 3; do
     window_in_special && return 0
-    sleep 0.2
+    "$SLEEP" 0.2
   done
   return 1
 }
@@ -146,18 +226,18 @@ do_open() {
   # Show the special workspace FIRST so a fresh client's workspace rule has
   # a visible target (spawning while it is hidden is what stranded windows).
   if ! dropdown_visible; then
-    hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
-    sleep 0.2
+    "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+    "$SLEEP" 0.2
   fi
   if [[ "$(client_count)" -eq 0 ]]; then
     spawn_client
     local i
     for i in 1 2 3 4 5; do
       [[ "$(client_count)" -ge 1 ]] && break
-      sleep 0.2
+      "$SLEEP" 0.2
     done
     # Let the fresh window map and take focus.
-    sleep 0.4
+    "$SLEEP" 0.4
   fi
   # A window that spawned while the rules could not place it may be stranded
   # on a normal workspace; pull it into the special workspace.
@@ -166,7 +246,7 @@ do_open() {
   fi
   # Show it once it is where it belongs (guarded against double-toggle).
   if window_in_special && ! dropdown_visible; then
-    hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+    "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
 
@@ -177,7 +257,7 @@ do_close() {
     pull_window_into_special || true
   fi
   if dropdown_visible; then
-    hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+    "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
 
@@ -190,31 +270,39 @@ do_toggle() {
 }
 
 do_kill() {
-  systemctl --user stop "$UNIT"
+  "$SYSTEMCTL" --user stop "$UNIT"
 }
 
 do_status() {
-  python3 "$BACKEND" status
+  "$PYTHON" "$BACKEND" status
 }
 
 do_install() {
-  [[ -x /usr/bin/foot ]] || die "foot not found at /usr/bin/foot"
-  python3 "$BACKEND" install
-  systemctl --user daemon-reload
-  systemctl --user enable --now "$UNIT"
-  hyprctl reload
+  # Everything the plugin cannot do for itself: config edits + the user unit.
+  "$PYTHON" -c "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)" "$BACKEND" \
+    || die "backend failed to compile"
+  "$PYTHON" "$BACKEND" install
+  "$SYSTEMCTL" --user daemon-reload
+  "$SYSTEMCTL" --user enable --now "$UNIT"
+  "$MKDIR" -p "$HOME/.local/bin"
+  "$LN" -sfn "$SCRIPT_DIR/omarchy-dropdown-terminal" "$LOCAL_BIN"
+  "$HYPRCTL" reload
   msg "Installed. Press SUPER + U to drop the terminal."
+  msg "Bar widget: $PLUGIN_ID (enable via omarchy plugin enable)."
+  msg "Uninstall any time with: omarchy-dropdown-terminal uninstall"
 }
 
 do_uninstall() {
-  python3 "$BACKEND" uninstall
-  systemctl --user daemon-reload
-  hyprctl reload
+  "$PYTHON" "$BACKEND" uninstall
+  "$SYSTEMCTL" --user daemon-reload
+  rm -f "$LOCAL_BIN"
+  "$HYPRCTL" reload
   msg "Uninstalled (keybind, rules, unit, server all removed)."
 }
 
 usage() {
-  cat <<'EOF'
+  local text
+  read -r -d '' text <<'EOF' || true
 Usage: omarchy-dropdown-terminal [command]
 
 commands:
@@ -226,18 +314,19 @@ commands:
   install     install keybind + rules + systemd unit
   uninstall   remove everything the plugin installed
 EOF
+  printf '%s\n' "$text"
 }
 
 main() {
   local cmd="${1:-toggle}"
   case "$cmd" in
-    toggle)    do_toggle ;;
-    open)      do_open ;;
-    close)     do_close ;;
-    status)    do_status ;;
-    kill)      do_kill ;;
-    install)   do_install ;;
-    uninstall) do_uninstall ;;
+    toggle)    resolve_tools toggle;    do_toggle ;;
+    open)      resolve_tools open;      do_open ;;
+    close)     resolve_tools close;     do_close ;;
+    status)    resolve_tools status;    do_status ;;
+    kill)      resolve_tools kill;      do_kill ;;
+    install)   resolve_tools install;   do_install ;;
+    uninstall) resolve_tools uninstall; do_uninstall ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $cmd (see --help)" ;;
   esac

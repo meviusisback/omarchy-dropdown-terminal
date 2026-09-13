@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
 Drop-down terminal backend for Omarchy (Hyprland Lua engine).
 
@@ -15,16 +15,20 @@ Design guarantees:
   - No user-controlled data is interpolated into any written file; the rules,
     hook, bind, and unit files are fixed constants.
   - Subprocess calls are argv arrays only; no shell=True anywhere.
+  - Every external tool is resolved to a validated absolute path (never PATH)
+    and runs with a minimal environment and bounded output - see proc.py.
 """
 
 import fcntl
 import json
 import os
 import stat as stat_module
-import subprocess
 import sys
 import tempfile
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import proc  # noqa: E402  (sibling module: trusted plugin code)
 
 HOME = os.path.expanduser("~")
 MARKER = "meviusisback.dropdown-terminal"
@@ -152,18 +156,59 @@ BIND_TAG = "Toggle drop-down terminal"
 # ----------------------------------------------------------------- utilities
 
 
-def _run(argv, timeout=10):
-    """Run an argv-array subprocess, never a shell. Never raises."""
-    try:
-        return subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, check=False
+# Every _call() argv recorded while DDT_TEST=1, so the test suite can assert on
+# the exact tool paths without touching systemd or the developer's compositor.
+CALLS = []
+
+
+class _Failed:
+    """Stand-in for a subprocess result when a call could not be made at all."""
+
+    def __init__(self, stderr):
+        self.returncode = 1
+        self.stdout = ""
+        self.stderr = stderr
+
+
+def _tool(name):
+    """Absolute path of a trusted system tool, or raise RuntimeError."""
+    path = proc.resolve(name)
+    if path is None:
+        raise RuntimeError(
+            f"no trusted {name!r} found in {' or '.join(proc.CANDIDATE_DIRS)} "
+            "(root-owned, not group/world-writable)"
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        class _Failed:
-            returncode = 1
-            stdout = ""
-            stderr = f"could not run {argv[0]}"
-        return _Failed()
+    return path
+
+
+def _call(name, *args, timeout=10):
+    """Run a trusted system tool with a minimal environment and bounded output.
+
+    `name` is resolved to a validated absolute path (never through PATH); a tool
+    that cannot be resolved fails safely rather than being looked up by the OS.
+    Under DDT_TEST the call is recorded and skipped, which keeps the test suite
+    hermetic - no systemd or compositor side effects from a test run.
+    """
+    try:
+        binary = _tool(name)
+    except RuntimeError as exc:
+        return _Failed(str(exc))
+    argv = [binary, *args]
+    if os.environ.get("DDT_TEST") == "1":
+        CALLS.append(argv)
+        return proc.Result(0, "", "")
+    try:
+        return proc.run(argv, timeout=timeout)
+    except (ValueError, OSError, proc.ToolNotFound) as exc:
+        return _Failed(f"could not run {name}: {exc}")
+
+
+def _run(argv, timeout=10):
+    """Run an argv array whose argv[0] is already an absolute path. Never raises."""
+    try:
+        return proc.run(argv, timeout=timeout)
+    except (ValueError, OSError, proc.ToolNotFound) as exc:
+        return _Failed(str(exc))
 
 
 def _locked(path, mode="a+"):
@@ -280,17 +325,36 @@ def install_unit():
                 dst.write(src.read())
             print(f"backed up existing {UNIT_DST_PATH} -> {backup}")
     atomic_write(UNIT_DST_PATH, UNIT_BODY)
-    _run(["systemctl", "--user", "daemon-reload"])
+    _call("systemctl", "--user", "daemon-reload")
     return True
 
 
 def enable_server():
     """Enable + start the dropdown foot server instance."""
-    _run(["systemctl", "--user", "enable", "--now", UNIT_REF])
+    _call("systemctl", "--user", "enable", "--now", UNIT_REF)
 
 
 def install(quiet=False):
     results = {}
+
+    # 0. The plugin's own executables are pinned by absolute shebang and the
+    #    unit hard-codes /usr/bin/foot, so verify those interpreters/binaries
+    #    exist at trusted absolute paths before writing anything: an
+    #    unsupported layout must fail loudly, not leave a half-installed plugin.
+    tools = {name: proc.resolve(name) for name in ("python3", "bash", "foot")}
+    missing = sorted(name for name, path in tools.items() if path is None)
+    # Under DDT_TEST the suite runs unprivileged (and, in the dev sandbox, in a
+    # user namespace where root-owned files read as nobody), so the hard failure
+    # is skipped there; the live install exercises it for real.
+    if missing and os.environ.get("DDT_TEST") != "1":
+        raise SystemExit(
+            "missing trusted tools: "
+            + ", ".join(missing)
+            + " (looked in /usr/bin, /bin, /usr/local/bin; must be root-owned and"
+            " not group/world-writable)"
+        )
+    results["tools"] = tools
+    results["tools_missing"] = missing
 
     # 1. Hyprland rules file (always regenerated, marker-checked).
     atomic_write(RULES_PATH, RULES_BODY)
@@ -335,13 +399,13 @@ def uninstall():
     results = {}
 
     # 1. Stop + disable the server (ordered to defeat Restart respawn).
-    _run(["systemctl", "--user", "disable", "--now", UNIT_REF])
+    _call("systemctl", "--user", "disable", "--now", UNIT_REF)
     for _ in range(20):
-        if _run(["systemctl", "--user", "is-active", UNIT_REF]).stdout.strip() != "active":
+        if _call("systemctl", "--user", "is-active", UNIT_REF).stdout.strip() != "active":
             break
         time.sleep(0.25)
-    _run(["systemctl", "--user", "kill", "--kill-whom=main", UNIT_REF])
-    _run(["systemctl", "--user", "mask", UNIT_REF])
+    _call("systemctl", "--user", "kill", "--kill-whom=main", UNIT_REF)
+    _call("systemctl", "--user", "mask", UNIT_REF)
     results["unit"] = "stopped+disabled+masked"
 
     # 2. Remove the keybind block, the hook line, the rules file.
@@ -354,13 +418,13 @@ def uninstall():
         results["rules_file"] = "absent"
 
     # 3. Unmask + remove unit file + reload.
-    _run(["systemctl", "--user", "unmask", UNIT_REF])
+    _call("systemctl", "--user", "unmask", UNIT_REF)
     try:
         os.unlink(UNIT_DST_PATH)
         results["unit_file"] = "removed"
     except FileNotFoundError:
         results["unit_file"] = "absent"
-    _run(["systemctl", "--user", "daemon-reload"])
+    _call("systemctl", "--user", "daemon-reload")
 
     try:
         os.unlink(LOCK_PATH)
@@ -390,10 +454,10 @@ def _remove_hook_line():
 
 def status():
     out = {"server": "unknown", "window": None, "workspace": None, "keybind": "SUPER + U"}
-    unit = _run(["systemctl", "--user", "is-active", UNIT_REF]).stdout.strip()
+    unit = _call("systemctl", "--user", "is-active", UNIT_REF).stdout.strip()
     out["server"] = unit or "unknown"
 
-    clients = _run(["hyprctl", "clients", "-j"]).stdout
+    clients = _call("hyprctl", "clients", "-j").stdout
     try:
         data = json.loads(clients) if clients else []
         for c in data:
@@ -404,7 +468,7 @@ def status():
     except (json.JSONDecodeError, AttributeError, TypeError):
         pass  # hyprctl unavailable or malformed output: keep safe fallback
 
-    mons = _run(["hyprctl", "monitors", "-j"]).stdout
+    mons = _call("hyprctl", "monitors", "-j").stdout
     try:
         mdata = json.loads(mons) if mons else []
         for m in mdata:

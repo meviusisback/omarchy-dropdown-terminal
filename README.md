@@ -21,13 +21,17 @@ switch, and even a shell restart.
 - **Centered geometry** - 80% width, 45% height, just below the top bar, with
   a rounded 3px border. Geometry is expressed in `monitor_w/H` formulas, so it
   adapts to any monitor/resolution change without reinstalling.
-- **Click outside to dismiss** - a focus watcher closes the dropdown the moment
-  it loses focus. Dismissal is click-based: the plugin sets
-  `input:follow_mouse = 0` and `float_switch_override_focus = 0` so moving the
-  mouse never steals focus, and `input:special_fallthrough` lets your click
-  reach the window underneath.
+- **Click outside to dismiss** - a focus watcher hides the dropdown the moment
+  it loses focus. It is **event-driven**: the watcher subscribes to Hyprland's
+  event socket (`activewindow` / `activespecial`), so it costs nothing while you
+  work instead of polling the compositor several times a second. Dismissal is
+  click-based: the plugin sets `input:follow_mouse = 0` and
+  `float_switch_override_focus = 0` so moving the mouse never steals focus, and
+  `input:special_fallthrough` lets your click reach the window underneath.
 - **Bar widget** - shows terminal state at a glance (accent = shown). Left
-  click toggles, right click opens a small menu (show/hide, kill server).
+  click toggles, right click opens a small menu (show/hide, kill server). The
+  state is event-driven too: the watcher publishes it to a small file the widget
+  watches, so there is no periodic status poll.
 - **IPC control** - `omarchy-shell shell toggle meviusisback.dropdown-terminal`
   plus `open`, `close`, `kill`, `status` methods.
 - **Clean install/uninstall** - one marker-anchored block in your Hyprland
@@ -43,8 +47,11 @@ switch, and even a shell restart.
   untouched, because the dropdown uses its own app-id and socket.
 - **systemd user instance** - the session lives in the user unit
   `foot-server@dropdown-terminal.service`.
-- **python3** - standard library only. The install/uninstall backend and the
-  focus watcher use no third-party packages.
+- **python3** and **bash** at their absolute system paths (`/usr/bin/python3`,
+  `/usr/bin/bash`) - standard library only; the backend, the watcher and the CLI
+  use no third-party packages. The plugin resolves every tool it runs to a
+  validated absolute path and never through `PATH` (see *Notes* below), so a
+  layout that keeps them elsewhere is not supported.
 - **omarchy-shell** - for the bar widget and the
   `omarchy-shell shell toggle meviusisback.dropdown-terminal` IPC method.
 
@@ -112,11 +119,20 @@ uninstall remove everything the plugin installed
 ## How it works
 
 ```
-SUPER+U  ->  omarchy-dropdown-terminal toggle
-              |-- systemctl --user start foot-server@dropdown-terminal (if dead)
+SUPER+U  ->  omarchy-dropdown-terminal toggle        (every tool resolved to a
+              |-- systemctl --user start foot-server@...   validated absolute path,
+              |                                             never through PATH)
               |-- footclient -> attaches to the persistent server
               '-> hyprctl dispatch 'hl.dsp.workspace.toggle_special("dropdown")'
                     (specialWorkspaceIn/Out animation: drops in from the top)
+
+Hyprland event socket ($XDG_RUNTIME_DIR/hypr/<signature>/.socket2.sock)
+   '-- backend/focus_watcher.py (one long-lived process, no polling)
+         |-- activewindow >> class != org.omarchy.dropdown-terminal
+         |     -> hide through the CLI (same guarded dispatch as above)
+         '-- activespecial >> special:dropdown | (empty)
+               -> publish visibility to $XDG_RUNTIME_DIR/dropdown-terminal.state
+                     '-- the bar widget watches that file for its icon state
 ```
 
 The foot server keeps ONE long-lived Wayland client alive. Every dropdown
@@ -130,12 +146,26 @@ your regular foot windows are untouched.
 
 - Only one dropdown window at a time (by design - it's a Quake dropdown).
 - Wayland-only (Hyprland). X11 is not supported.
-- The bar widget reflects state on a 5 s poll; toggling via keybind updates
-  it on the next tick.
+- The bar widget's state is event-driven: the watcher publishes
+  `$XDG_RUNTIME_DIR/dropdown-terminal.state` (0600) whenever the dropdown is
+  shown or hidden, and the widget watches that file. If the runtime directory is
+  unset or not absolute the widget falls back to a slow 30 s reconcile instead.
 - Dismissal is **click-based**: clicking another window closes the dropdown and
   focuses that window. Clicking *bare desktop background* (no window under the
   cursor) raises no Hyprland event, and clicking the bar does not move keyboard
   focus, so neither closes it - use `SUPER + U` for those.
+- **No `PATH`, minimal environment, bounded output.** The watcher, the backend
+  and the CLI resolve every tool they run (`python3`, `bash`, `hyprctl`,
+  `systemctl`, `footclient`, `setsid`, ...) to a validated absolute path from a
+  fixed list of root-owned directories, and refuse to run anything that is
+  group/world-writable or not owned by root; `PATH` is never consulted, so a
+  malicious earlier entry in it cannot be launched by enabling the widget. The
+  watcher is started with a cleared environment (`/usr/bin/env -i`, only the
+  variables it needs) and an isolated interpreter (`-I -E -S`); its children get
+  an environment allowlist and a controlled `PATH`, and captured output is capped
+  (a child that exceeds the cap, or outlives its timeout, is killed as a process
+  group). `omarchy plugin validate .` and the unit tests below cover these
+  guarantees.
 - The plugin sets three global input options in
   `~/.config/hypr/dropdown-terminal.lua`: `special_fallthrough = true`,
   `follow_mouse = 0` and `float_switch_override_focus = 0`. The last two turn
@@ -156,6 +186,17 @@ your regular foot windows are untouched.
   (speed, bezier) no longer reach them, so revisit this block if you reshuffle
   your animations. The bezier is Omarchy's curve - if it ever stops resolving,
   `hyprctl configerrors` reports it and the direction simply is not applied.
+
+## Tests
+
+Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
+records instead of running `systemctl`):
+
+```bash
+python3 tests/test_backend.py        # config writes, idempotency, tool resolution
+python3 tests/test_proc.py           # trusted-path resolver, output cap, timeouts
+python3 tests/test_focus_watcher.py  # event state machine, path validation, state file
+```
 
 ## License
 

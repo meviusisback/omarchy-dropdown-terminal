@@ -144,6 +144,98 @@ class BackendTest(unittest.TestCase):
         for name in os.listdir(backend.HYPRLAND_DIR):
             self.assertFalse(name.startswith(".ddterm-"), f"leftover temp file: {name}")
 
+    def test_every_external_call_uses_an_absolute_trusted_path(self):
+        # The plugin is started automatically once the widget is enabled, so no
+        # call site may leave a tool to be found through PATH. _call() resolves
+        # names through proc.resolve(); stub that here (the dev sandbox cannot
+        # see root-owned files) and assert every recorded argv[0] is absolute and
+        # comes from a trusted candidate directory.
+        original = backend.proc.resolve
+        backend.proc.resolve = lambda name, *a, **k: f"/usr/bin/{name}"
+        backend.CALLS.clear()
+        try:
+            backend.install(quiet=True)
+            backend.uninstall()
+        finally:
+            backend.proc.resolve = original
+        self.assertTrue(backend.CALLS, "expected the install path to call systemctl")
+        for argv in backend.CALLS:
+            self.assertTrue(os.path.isabs(argv[0]), argv)
+            self.assertTrue(
+                any(argv[0].startswith(directory + os.sep)
+                    for directory in backend.proc.CANDIDATE_DIRS),
+                f"{argv[0]} does not come from a trusted candidate directory",
+            )
+
+    def test_no_call_site_passes_a_bare_tool_name(self):
+        # A bare name in an argv array is resolved through PATH by the OS, which
+        # is exactly what the review blocked. _call() must be the only way the
+        # backend starts a tool.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "backend", "dropdown_terminal.py")) as handle:
+            source = handle.read()
+        self.assertNotIn("_run([\"", source)
+        self.assertNotIn("subprocess.", source)
+
+    def test_install_fails_loudly_without_trusted_tools(self):
+        original = backend.proc.resolve
+        ddt = os.environ.pop("DDT_TEST", None)
+        backend.proc.resolve = lambda *args, **kwargs: None
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                backend.install(quiet=True)
+            self.assertIn("missing trusted tools", str(caught.exception))
+        finally:
+            backend.proc.resolve = original
+            if ddt is not None:
+                os.environ["DDT_TEST"] = ddt
+
+    def test_plugin_scripts_pin_absolute_interpreters(self):
+        # A `#!/usr/bin/env …` shebang is a PATH lookup performed by the kernel,
+        # which would reintroduce exactly what the review asked to remove.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        for rel in ("backend/dropdown_terminal.py", "backend/focus_watcher.py",
+                    "backend/proc.py", "bin/omarchy-dropdown-terminal", "install.sh"):
+            with open(os.path.join(repo, rel)) as handle:
+                first = handle.readline().strip()
+            self.assertRegex(first, r"^#!/usr/bin/(python3|bash)$", rel)
+
+    def test_panel_launches_the_watcher_without_path_or_inherited_env(self):
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "Panel.qml")) as handle:
+            panel = handle.read()
+        self.assertNotIn('["python3"', panel)
+        self.assertIn('"/usr/bin/env"', panel)
+        self.assertIn('"-i"', panel)
+        self.assertIn('"/usr/bin/python3"', panel)
+        self.assertIn('"-I"', panel)
+        self.assertIn('"-E"', panel)
+        self.assertIn('"-S"', panel)
+
+    def test_cli_never_invokes_a_tool_by_bare_name(self):
+        # The CLI may run with no PATH at all (the watcher spawns it with a
+        # minimal environment), so every tool must go through need()/$VARS.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        path = os.path.join(repo, "bin", "omarchy-dropdown-terminal")
+        with open(path) as handle:
+            lines = handle.readlines()
+        source = "".join(lines)
+        self.assertNotIn("command -v", source)
+        self.assertNotIn("/usr/bin/env", source)
+        bare = re.compile(
+            r"(?:^|[;&|(`]\s*)(python3|hyprctl|systemctl|sleep|setsid|footclient"
+            r"|mkdir|ln|stat|readlink|id)\s"
+        )
+        for number, line in enumerate(lines, 1):
+            if line.strip().startswith("#"):
+                continue
+            self.assertIsNone(
+                bare.search(line), f"bare tool invocation on line {number}: {line.strip()}"
+            )
+        # and the resolver is the single place that decides trust
+        self.assertIn("need() {", source)
+        self.assertIn("dir_trusted() {", source)
+
 
 if __name__ == "__main__":
     unittest.main()
