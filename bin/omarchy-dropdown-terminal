@@ -59,14 +59,22 @@ REAL_UID="$("$STAT_BIN" -L -c '%u' -- /proc/self 2>/dev/null)" || REAL_UID=""
 # 0 when $1 is a root-owned directory that group/others cannot write, walking up
 # to / — an attacker-writable directory in the chain would void the check.
 # (Called with the RESOLVED path's directory, never the literal one.)
+# Per-directory verdicts are memoized for the life of this process: directory
+# trust cannot change within a single CLI run (and per-file stats are NOT
+# cached — need() still stats every candidate file itself), so this only skips
+# re-walking chains already judged by this same process.
+declare -A _DIR_TRUST_CACHE=()
 dir_trusted() {
   local d="$1" st uid mode
+  local start="$1"
+  if [[ -n "${_DIR_TRUST_CACHE[$start]+x}" ]]; then
+    return "${_DIR_TRUST_CACHE[$start]}"
+  fi
   while :; do
-    st="$("$STAT_BIN" -L -c '%u %a' -- "$d" 2>/dev/null)" || return 1
+    st="$("$STAT_BIN" -L -c '%u %a' -- "$d" 2>/dev/null)" || { _DIR_TRUST_CACHE[$start]=1; return 1; }
     uid="${st%% *}"; mode="${st##* }"
-    [ "$uid" = "0" ] || return 1
-    (( 8#$mode & 8#022 )) && return 1
-    [ "$d" = "/" ] && return 0
+    if [ "$uid" != "0" ] || (( 8#$mode & 8#022 )); then _DIR_TRUST_CACHE[$start]=1; return 1; fi
+    if [ "$d" = "/" ]; then _DIR_TRUST_CACHE[$start]=0; return 0; fi
     d="${d%/*}"; [ -n "$d" ] || d=/
   done
 }
@@ -159,72 +167,100 @@ ensure_server() {
   die "foot server socket did not appear at $sock"
 }
 
-# Exit 0 = "special:dropdown" is shown, 1 = hidden, 3 = the compositor answered
-# something unusable. A failed probe must not be read as "hidden": that would toggle
-# the workspace the wrong way on the next open/close.
-dropdown_probe() {
-  "$HYPRCTL" monitors -j | "$PYTHON" -I -E -S -c '
+# One combined compositor query for the toggle path: prints a single line
+#   VISIBLE=<0|1|3> COUNT=<n> INSPECIAL=<0|1>
+# replacing the old dropdown_probe + client_count + window_in_special trio
+# (up to five hyprctl and three python invocations per toggle) with two
+# hyprctl calls and one python.
+#
+# Failure contracts match the old probes exactly, and the two payloads parse
+# INDEPENDENTLY: malformed monitors -> VISIBLE=3 (every caller refuses to
+# toggle, as with the old probe=3 — "no information" is never read as
+# "hidden"); malformed/oversized clients -> COUNT=0, INSPECIAL=0 (the old
+# client_count/window_in_special fallbacks). Bad clients can never force
+# VISIBLE=3 and bad monitors can never yield VISIBLE=0/1. A totally empty
+# result (the parser itself died) also refuses via parse_snapshot's default.
+snapshot() {
+  local snap
+  snap="$({
+    "$HYPRCTL" monitors -j 2>/dev/null
+    printf '\0SNAP\0'
+    "$HYPRCTL" clients -j 2>/dev/null
+  } | "$PYTHON" -I -E -S -c '
 import json, sys
-MAX = 262144
-raw = sys.stdin.buffer.read(MAX + 1)
-if len(raw) > MAX:
-    sys.exit(3)
+MON_MAX = 262144
+CLI_MAX = 4194304
+raw = sys.stdin.buffer.read(MON_MAX + CLI_MAX + 8)
+mon_raw, _, cli_raw = raw.partition(b"\x00SNAP\x00")
+visible = 3
 try:
-    data = json.loads(raw)
-except (json.JSONDecodeError, TypeError):
-    sys.exit(3)
-if not isinstance(data, list):
-    sys.exit(3)
-for m in data:
-    if not isinstance(m, dict):
-        sys.exit(3)
-    sp = m.get("specialWorkspace")
-    if sp is not None and not isinstance(sp, dict):
-        sys.exit(3)
-    name = (sp.get("name") or "") if isinstance(sp, dict) else ""
-    if not isinstance(name, str):
-        sys.exit(3)
-    if name == "special:dropdown":
-        sys.exit(0)
-sys.exit(1)
-'
+    if len(mon_raw) > MON_MAX:
+        raise ValueError("oversized monitors payload")
+    mdata = json.loads(mon_raw) if mon_raw.strip() else None
+    if isinstance(mdata, list):
+        visible = 1
+        for m in mdata:
+            if not isinstance(m, dict):
+                visible = 3
+                break
+            sp = m.get("specialWorkspace")
+            if sp is not None and not isinstance(sp, dict):
+                visible = 3
+                break
+            name = (sp.get("name") or "") if isinstance(sp, dict) else ""
+            if not isinstance(name, str):
+                visible = 3
+                break
+            if name == "special:dropdown":
+                visible = 0
+                break
+except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
+    visible = 3
+count = 0
+inspecial = 0
+try:
+    if len(cli_raw) > CLI_MAX:
+        raise ValueError("oversized clients payload")
+    cdata = json.loads(cli_raw) if cli_raw.strip() else []
+    if isinstance(cdata, list):
+        # The old window_in_special capped clients at MON_MAX while client_count
+        # allowed CLI_MAX: keep both caps so each half keeps its old fallback.
+        clients_ok = len(cli_raw) <= MON_MAX
+        for c in cdata:
+            if isinstance(c, dict) and c.get("class") == "org.omarchy.dropdown-terminal":
+                count += 1
+                if clients_ok:
+                    ws = c.get("workspace")
+                    ws = (ws.get("name") or "") if isinstance(ws, dict) else ""
+                    if ws == "special:dropdown":
+                        inspecial = 1
+except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
+    pass
+print(f"VISIBLE={visible} COUNT={count} INSPECIAL={inspecial}")
+' 2>/dev/null)" || true
+  if [ -z "$snap" ]; then
+    printf 'VISIBLE=3 COUNT=0 INSPECIAL=0\n'
+  else
+    printf '%s\n' "$snap"
+  fi
 }
 
-dropdown_visible() { dropdown_probe; }
-
-# Count clients of the dropdown foot window.
-client_count() {
-  # The python prints a number for every outcome (empty, malformed, oversized), so it
-  # must NOT be combined with a shell fallback that appends a second line: two lines
-  # would make the arithmetic comparisons in do_open/do_close fail and silently skip
-  # the spawn. The cap is generous because we would rather read a large client list
-  # than SIGPIPE hyprctl into a bogus count.
-  local n
-  n="$("$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
-import json, sys
-MAX = 4194304
-raw = sys.stdin.buffer.read(MAX + 1)
-if len(raw) > MAX:
-    print(0)
-    sys.exit(0)
-try:
-    data = json.loads(raw) if raw else []
-except (json.JSONDecodeError, TypeError):
-    print(0)
-    sys.exit(0)
-if not isinstance(data, list):
-    print(0)
-    sys.exit(0)
-n = 0
-for c in data:
-    if isinstance(c, dict) and c.get("class") == "org.omarchy.dropdown-terminal":
-        n += 1
-print(n)
-' 2>/dev/null)" || n=""
-  case "$n" in
-    ""|*[!0-9]*) n=0 ;;
+# Parse snapshot()'s line into SNAP_VISIBLE/SNAP_COUNT/SNAP_INSPECIAL with a
+# numeric allowlist at the boundary (no word splitting, no eval): anything
+# unexpected keeps the refuse-to-toggle default (VISIBLE=3), never a guess.
+parse_snapshot() {
+  SNAP_VISIBLE=3; SNAP_COUNT=0; SNAP_INSPECIAL=0
+  case " $1 " in
+    *" VISIBLE=0 "*) SNAP_VISIBLE=0 ;;
+    *" VISIBLE=1 "*) SNAP_VISIBLE=1 ;;
   esac
-  printf '%s' "$n"
+  local rest n
+  rest="${1#*COUNT=}"
+  n="${rest%% *}"
+  case "$n" in ''|*[!0-9]*) ;; *) SNAP_COUNT="$n" ;; esac
+  case " $1 " in
+    *" INSPECIAL=1 "*) SNAP_INSPECIAL=1 ;;
+  esac
 }
 
 # The foot client socket path. Both the directory rules AND the socket filename come
@@ -259,25 +295,6 @@ spawn_client() {
   [ "$uid" = "$REAL_UID" ] || die "refusing to use $sock: it is not ours"
   "$SETSID" "$FOOTCLIENT" --server-socket="$sock" >/dev/null 2>&1 &
   disown || true
-}
-
-window_in_special() {
-  "$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
-import json, sys
-MAX = 262144
-raw = sys.stdin.buffer.read(MAX + 1)
-if len(raw) > MAX:
-    sys.exit(1)
-try:
-    data = json.loads(raw) if raw else []
-except (json.JSONDecodeError, TypeError):
-    sys.exit(1)
-for c in data:
-    if c.get("class") == "org.omarchy.dropdown-terminal":
-        ws = (c.get("workspace") or {}).get("name") or ""
-        sys.exit(0 if ws == "special:dropdown" else 1)
-sys.exit(1)
-'
 }
 
 # Exit 0 if the dropdown window is the active window.
@@ -338,66 +355,86 @@ pull_window_into_special() {
   "$HYPRCTL" dispatch 'hl.dsp.window.move({ workspace = "special:dropdown" })' >/dev/null 2>&1 || true
   local i
   for i in 1 2 3; do
-    window_in_special && return 0
+    parse_snapshot "$(snapshot)"
+    [ "$SNAP_INSPECIAL" = "1" ] && return 0
     "$SLEEP" 0.2
   done
   return 1
 }
 
+# The entry snapshot (SNAP_VISIBLE/SNAP_COUNT/SNAP_INSPECIAL) is taken once by
+# do_toggle and shared with do_open/do_close; direct `open`/`close` take their
+# own. SNAP_SET marks it fresh for this invocation.
 do_open() {
   ensure_server
+  if [ -z "${SNAP_SET:-}" ]; then
+    parse_snapshot "$(snapshot)"
+    SNAP_SET=1
+  fi
   # Show the special workspace FIRST so a fresh client's workspace rule has
   # a visible target (spawning while it is hidden is what stranded windows).
-  local probe=0
-  dropdown_probe || probe=$?
-  if [ "$probe" = "3" ]; then
+  if [ "$SNAP_VISIBLE" = "3" ]; then
     die "cannot read the compositor state (unusable monitor list); refusing to toggle"
   fi
-  if [ "$probe" = "1" ]; then
+  if [ "$SNAP_VISIBLE" = "1" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
     "$SLEEP" 0.2
   fi
-  if [[ "$(client_count)" -eq 0 ]]; then
+  if [ "$SNAP_COUNT" -eq 0 ]; then
     spawn_client
     local i
     for i in 1 2 3 4 5; do
-      [[ "$(client_count)" -ge 1 ]] && break
+      parse_snapshot "$(snapshot)"
+      [ "$SNAP_COUNT" -ge 1 ] && break
       "$SLEEP" 0.2
     done
     # Let the fresh window map and take focus.
     "$SLEEP" 0.4
   fi
   # A window that spawned while the rules could not place it may be stranded
-  # on a normal workspace; pull it into the special workspace.
-  if ! window_in_special; then
+  # on a normal workspace; pull it into the special workspace. Re-query first
+  # when no spawn happened above: the entry snapshot is stale by now and the
+  # old code queried fresh here too.
+  if [ "$SNAP_COUNT" -gt 0 ]; then
+    parse_snapshot "$(snapshot)"
+  fi
+  if [ "$SNAP_INSPECIAL" != "1" ]; then
     pull_window_into_special || true
+    # The pull may have moved the window: the entry snapshot's INSPECIAL is
+    # stale, so re-query before the show guard below (a just-placed window
+    # would otherwise stay hidden).
+    parse_snapshot "$(snapshot)"
   fi
   # Show it once it is where it belongs (guarded against double-toggle).
-  probe=0
-  dropdown_probe || probe=$?
-  if [ "$probe" != "3" ] && window_in_special && [ "$probe" = "1" ]; then
+  # A mid-run monitors failure (VISIBLE=3) skips the show, as before.
+  if [ "$SNAP_VISIBLE" != "3" ] && [ "$SNAP_INSPECIAL" = "1" ] && [ "$SNAP_VISIBLE" = "1" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
 
 do_close() {
+  if [ -z "${SNAP_SET:-}" ]; then
+    parse_snapshot "$(snapshot)"
+    SNAP_SET=1
+  fi
   # Hide = toggle the special workspace away. If the window is stranded on
   # a normal workspace, pull it in first so the toggle actually hides it.
-  if [[ "$(client_count)" -ge 1 ]] && ! window_in_special; then
+  if [ "$SNAP_COUNT" -ge 1 ] && [ "$SNAP_INSPECIAL" != "1" ]; then
     pull_window_into_special || true
+    parse_snapshot "$(snapshot)"
   fi
-  local probe=0
-  dropdown_probe || probe=$?
-  if [ "$probe" = "3" ]; then
+  if [ "$SNAP_VISIBLE" = "3" ]; then
     die "cannot read the compositor state (unusable monitor list); refusing to toggle"
   fi
-  if [ "$probe" = "0" ]; then
+  if [ "$SNAP_VISIBLE" = "0" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
   fi
 }
 
 do_toggle() {
-  if dropdown_visible && window_in_special; then
+  parse_snapshot "$(snapshot)"
+  SNAP_SET=1
+  if [ "$SNAP_VISIBLE" = "0" ] && [ "$SNAP_INSPECIAL" = "1" ]; then
     do_close
   else
     do_open
