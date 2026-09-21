@@ -14,6 +14,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 sys.path.insert(0, BACKEND_DIR)
@@ -156,10 +157,14 @@ class RuntimeDirTest(unittest.TestCase):
             self.assertEqual(watcher_mod.home_dir(), real_home)
 
     def test_returns_none_when_nothing_is_acceptable(self):
-        with _env("XDG_RUNTIME_DIR", "/etc"):
-            # /etc is root-owned but not ours, and the fallback is still valid here;
-            # with a stricter uid set (root only) even the fallback must be refused.
-            self.assertIsNone(watcher_mod.runtime_dir((0,)))
+        # The leaf is always required to be owned by the REAL uid (ancestor_uids only
+        # constrains the directories above it), so the "nothing qualifies" case needs a
+        # uid that owns no candidate at all: /etc is root-owned and /run/user/<uid> does
+        # not exist for it, so neither the XDG candidate nor the systemd fallback passes.
+        with _env("XDG_RUNTIME_DIR", "/etc"), mock.patch.object(
+            os, "getuid", return_value=424242
+        ):
+            self.assertIsNone(watcher_mod.runtime_dir((0, 424242)))
 
 
 class SocketPathTest(unittest.TestCase):

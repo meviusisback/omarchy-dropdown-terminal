@@ -527,15 +527,38 @@ def read_text(path, limit=MAX_CONFIG_BYTES):
 
 
 def append_block(path, begin, body, end):
-    """Append a BEGIN/body/END block if its marker is absent. Serialized."""
+    """Write the BEGIN/body/END block: append it when absent, refresh it when the
+    contents inside the markers no longer match `body`. Serialized.
+
+    Returns True only when the file changed. Refreshing matters because the marker
+    alone proves nothing: the line INSIDE it is what Hyprland runs, so a keybind
+    written by an older install (a bare command name, say) has to be rewritten by
+    the next `install` instead of being reported as already-installed.
+
+    The comparison is on the block's CONTENTS and its canonical layout, so a block
+    an older version glued onto one line (`body-- END marker`) is rewritten into
+    the canonical three-line shape, and a current body is left strictly alone.
+    """
+    inner = "\n" + body.rstrip("\n") + "\n"
+    block = begin + inner + end + "\n"
     with _locked(LOCK_PATH) as _:
         content = read_text(path) or ""
-        if begin in content:
-            return False
+        start = content.find(begin)
+        if start != -1:
+            stop = content.find(end, start + len(begin))
+            if stop == -1:
+                # BEGIN without END: unterminated, and remove_block (not a blind
+                # rewrite) owns that error. Leave the file exactly as it is.
+                return False
+            if content[start + len(begin):stop] == inner:
+                return False
+            line_end = content.find("\n", stop)
+            line_end = len(content) if line_end == -1 else line_end + 1
+            atomic_write(path, content[:start] + block + content[line_end:])
+            return True
         if content and not content.endswith("\n"):
             content += "\n"
-        content += begin + "\n" + body + end + "\n"
-        atomic_write(path, content)
+        atomic_write(path, content + block)
         return True
 
 
@@ -674,8 +697,11 @@ def install(quiet=False):
     if conflict:
         results["keybind"] = f"CONFLICT: SUPER + U already used by: {conflict}"
     else:
-        added = append_block(BINDINGS_LUA, BIND_BEGIN, bind_body(), BIND_END)
-        results["keybind"] = "added" if added else "already-installed"
+        had_block = BIND_BEGIN in (read_text(BINDINGS_LUA) or "")
+        changed = append_block(BINDINGS_LUA, BIND_BEGIN, bind_body(), BIND_END)
+        results["keybind"] = (
+            ("added" if not had_block else "updated") if changed else "already-installed"
+        )
 
     # 4. systemd unit (with the validated foot path) + enable.
     install_unit(tools["foot"])

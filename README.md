@@ -82,8 +82,11 @@ What it does:
    (`$XDG_CONFIG_HOME/hypr`, or `~/.config/hypr` when unset) and hooks it
    into `~/.config/hypr/hyprland.lua` (same pattern as the Omarchy
    workspace-layout plugin).
-3. Appends a marker-anchored keybind block to `~/.config/hypr/bindings.lua`:
-   `SUPER + U` -> `omarchy-dropdown-terminal toggle`.
+3. Writes a marker-anchored keybind block to `~/.config/hypr/bindings.lua`:
+   `SUPER + U` -> `~/.local/bin/omarchy-dropdown-terminal toggle` (the absolute CLI
+   path in your home, never a `PATH` lookup). Re-running `install.sh` is safe: it
+   refreshes the block when its contents changed - the marker alone does not prove
+   the line inside it is current - and reports `updated` when it did.
 4. Reloads Hyprland. Press **SUPER + U**.
 
 ### Uninstall
@@ -219,7 +222,7 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 48 - config writes, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 53 - config writes, keybind refresh, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
 python3 tests/test_focus_watcher.py  # 41 - event state machine, path validation, state file, socket
 ```

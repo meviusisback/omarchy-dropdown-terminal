@@ -10,6 +10,7 @@ the environment's real tool ownership.
 import importlib
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -123,6 +124,67 @@ class BackendTest(unittest.TestCase):
         # Idempotent: second append is a no-op, no duplication.
         self.assertFalse(backend.append_block(backend.BINDINGS_LUA, backend.BIND_BEGIN, body, backend.BIND_END))
         self.assertEqual(backend.read_text(backend.BINDINGS_LUA).count("o.bind("), 1)
+
+    def test_append_block_keeps_the_marker_on_its_own_line(self):
+        # The block must be three lines. Gluing the body and the END marker onto one
+        # line still parses as Lua (the marker turns into a comment) but is not what
+        # bind_line() writes, and remove_block() then drops the body with the marker.
+        backend.atomic_write(backend.BINDINGS_LUA, "-- my binds\n")
+        body = backend.bind_body()
+        self.assertTrue(
+            backend.append_block(backend.BINDINGS_LUA, backend.BIND_BEGIN, body, backend.BIND_END)
+        )
+        lines = backend.read_text(backend.BINDINGS_LUA).splitlines()
+        self.assertIn(body, lines, "the body must sit alone on its line")
+        self.assertIn(backend.BIND_END, lines, "the END marker must not share the body's line")
+
+    def test_append_block_normalises_a_glued_block(self):
+        # Shape written by the old append path: body and END marker on one line.
+        backend.atomic_write(
+            backend.BINDINGS_LUA,
+            "-- my binds\n"
+            + backend.BIND_BEGIN
+            + "\n"
+            + backend.bind_body()
+            + backend.BIND_END
+            + "\n",
+        )
+        self.assertTrue(
+            backend.append_block(backend.BINDINGS_LUA, backend.BIND_BEGIN, backend.bind_body(), backend.BIND_END)
+        )
+        lines = backend.read_text(backend.BINDINGS_LUA).splitlines()
+        self.assertIn(backend.bind_body(), lines)
+        self.assertIn(backend.BIND_END, lines)
+        self.assertIn("-- my binds", lines, "content outside the block is preserved")
+        self.assertFalse(
+            backend.append_block(backend.BINDINGS_LUA, backend.BIND_BEGIN, backend.bind_body(), backend.BIND_END),
+            "the canonical shape must be a no-op on the next run",
+        )
+
+    def test_install_rewrites_a_stale_keybind_body_and_reports_it(self):
+        # The marker proves the block exists; the body inside it is what Hyprland runs.
+        # An older install wrote a bare command name - a reinstall must replace it and
+        # say "updated" instead of reporting the marker as already-installed.
+        stale_body = backend.bind_body().replace(
+            f"{backend.HOME}/.local/bin/omarchy-dropdown-terminal", "omarchy-dropdown-terminal"
+        )
+        self.assertNotEqual(stale_body, backend.bind_body())
+        backend.atomic_write(
+            backend.BINDINGS_LUA,
+            "-- my binds\n"
+            + backend.BIND_BEGIN
+            + "\n"
+            + stale_body
+            + "\n"
+            + backend.BIND_END
+            + "\n",
+        )
+        results = backend.install(quiet=True)
+        self.assertEqual(results["keybind"], "updated")
+        content = backend.read_text(backend.BINDINGS_LUA)
+        self.assertIn(backend.bind_body(), content)
+        self.assertNotIn('"omarchy-dropdown-terminal toggle"', content)
+        self.assertEqual(backend.install(quiet=True)["keybind"], "already-installed")
 
     def test_remove_block(self):
         backend.atomic_write(backend.BINDINGS_LUA, "before\n" + backend.bind_line() + "after\n")
@@ -403,9 +465,19 @@ class BackendTest(unittest.TestCase):
         # Hyprland (and the Lua hook) find the config through XDG_CONFIG_HOME: writing
         # to $HOME/.config while it points elsewhere installs rules nobody loads, so the
         # write commands require it to be valid instead of silently falling back.
-        with tempfile.TemporaryDirectory() as tmp:
+        #
+        # The fixture must NOT come from tempfile's default root: $TMPDIR is often /tmp,
+        # which is world-writable and therefore correctly refused by the candidate rules -
+        # asserting there would test the machine's temp policy, not this behaviour. A dir
+        # under the real home has an ancestor chain that qualifies on any normal host.
+        real_home = pwd.getpwuid(os.getuid()).pw_dir
+        cache = os.path.join(real_home, ".cache")
+        os.makedirs(cache, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as tmp:
             with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
-                self.assertEqual(backend._validated_config_dir(TEST_UIDS), tmp)
+                self.assertEqual(
+                    backend._validated_config_dir(TEST_UIDS), os.path.realpath(tmp)
+                )
             with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative/path"}):
                 self.assertEqual(
                     backend._validated_config_dir(TEST_UIDS), f"{backend.HOME}/.config"
