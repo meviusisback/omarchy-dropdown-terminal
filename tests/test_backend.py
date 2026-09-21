@@ -695,6 +695,135 @@ class BackendTest(unittest.TestCase):
         # the real uid is never taken from the environment
         self.assertNotIn('REAL_UID="${UID', code)
 
+    def test_snapshot_contracts(self):
+        # The merged snapshot() replaces dropdown_probe + client_count +
+        # window_in_special: one query, one parser, same failure contracts.
+        # Driven with stubbed HYPRCTL outputs so no compositor is needed.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            source = handle.read()
+        for name in ("snapshot() {", "parse_snapshot() {"):
+            self.assertIn(name, source)
+        start = source.index("snapshot() {")
+        end = source.index("\n}\n", start) + 3
+        snap_func = source[start:end]
+        start = source.index("parse_snapshot() {")
+        end = source.index("\n}\n", start) + 3
+        parse_func = source[start:end]
+        lib = snap_func + "\n" + parse_func + "\n"
+        cases = [
+            # (monitors payload, clients payload, visible, count, inspecial)
+            ('[{"specialWorkspace":{"name":"special:dropdown"}}]', "[]", 0, 0, 0),
+            ('[{"specialWorkspace":{"name":""}}]', "[]", 1, 0, 0),
+            ("[]", "[]", 1, 0, 0),
+            ("", "", 3, 0, 0),  # hyprctl died: refuse, never "hidden"
+            ("not json{{{", "[]", 3, 0, 0),
+            ("[]", "not json{{{", 1, 0, 0),  # bad clients: count fallback
+            ('[{"specialWorkspace":{"name":""}}]',
+             '[{"class":"org.omarchy.dropdown-terminal","workspace":{"name":"3"}}]',
+             1, 1, 0),  # stranded window
+            ('[{"specialWorkspace":{"name":""}}]',
+             '[{"class":"org.omarchy.dropdown-terminal",'
+             '"workspace":{"name":"special:dropdown"}}]',
+             1, 1, 1),  # placed window
+            ('[{"specialWorkspace":{"name":"special:xdropdown"}}]', "[]",
+             1, 0, 0),  # exact match only, no suffix
+            ('[{"specialWorkspace":5}]', "[]", 3, 0, 0),  # nested shape: refuse
+        ]
+        # Oversized payloads, past the parser caps (MON_MAX 262144,
+        # CLI_MAX 4194304): built here (payloads that big cannot be literals).
+        big_shown_mons = (
+            '[{"specialWorkspace":{"name":"special:dropdown"}},'
+            + '{"specialWorkspace":{"name":"%s","id":%d}},' * 2000
+            % tuple(v for i in range(2000) for v in ("x" * 100, i))
+            + '{"specialWorkspace":{"name":""}}]'
+        )
+        assert len(big_shown_mons) > 262144, len(big_shown_mons)
+        big_cli = (
+            '[{"class":"org.omarchy.dropdown-terminal",'
+            '"workspace":{"name":"special:dropdown"},"pad":"%s"}]' % ("y" * 300000)
+        )
+        assert 262144 < len(big_cli) <= 4194304, len(big_cli)
+        cases += [
+            # Oversized but otherwise VALID monitors: old probe refused (exit 3),
+            # so the merged parser must refuse too, not act on what it saw.
+            (big_shown_mons, "[]", 3, 0, 0),
+            # Oversized clients: old client_count fell back to 0; INSPECIAL
+            # keeps the old window_in_special cap (MON_MAX), so it stays 0 too.
+            ("[]", big_cli, 1, 1, 0),
+            # Non-dict client entries: skipped, never crash, never counted.
+            ("[]", '["x", 5, null]', 1, 0, 0),
+        ]
+        # Harness: stub HYPRCTL as a shell FUNCTION (functions see the
+        # test shell's STUBDIR; a script file would not, since snapshot()
+        # runs it via "$HYPRCTL" with only the exported env).
+        harness = (
+            "set -uo pipefail\n"
+            + lib +
+            "STUBDIR=$(mktemp -d)\n"
+            "export STUBDIR\n"
+            "set +u\n"
+            'cp "$MONS_FILE" "$STUBDIR/mons.json"\n'
+            'cp "$CLS_FILE" "$STUBDIR/cls.json"\n'
+            "hyprctl() { if [ \"$1\" = monitors ]; then cat \"$STUBDIR/mons.json\"; "
+            "else cat \"$STUBDIR/cls.json\"; fi; }\n"
+            "HYPRCTL=hyprctl\n"
+            "PYTHON=/usr/bin/python3\n"
+            's="$(snapshot)"\n'
+            'parse_snapshot "$s"\n'
+            'printf "V=%s C=%s I=%s\\n" "$SNAP_VISIBLE" "$SNAP_COUNT" "$SNAP_INSPECIAL"\n'
+        )
+        for mons, clients, visible, count, inspecial in cases:
+            # Payloads past the parser caps ride in files (argv+env have a
+            # kernel size limit); the stub reads them by path when set.
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mons", delete=False
+            ) as mons_file:
+                mons_file.write(mons)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".clients", delete=False
+            ) as clients_file:
+                clients_file.write(clients)
+            try:
+                env = dict(
+                    os.environ,
+                    MONS_FILE=mons_file.name,
+                    CLS_FILE=clients_file.name,
+                )
+                completed = subprocess.run(
+                    ["/usr/bin/bash", "-c", harness],
+                    capture_output=True, text=True, timeout=60, env=env,
+                )
+            finally:
+                os.unlink(mons_file.name)
+                os.unlink(clients_file.name)
+            self.assertEqual(
+                completed.stdout.strip(), f"V={visible} C={count} I={inspecial}",
+                f"mons_len={len(mons)} clients_len={len(clients)}: "
+                f"{completed.stdout!r}{completed.stderr!r}",
+            )
+
+    def test_dir_trust_cache_returns_the_same_verdicts(self):
+        # The dir_trusted memoization must not change any verdict: run the same
+        # directories twice (cache cold, then warm) plus an untrusted one.
+        script = (
+            "set -uo pipefail\n"
+            'STAT_BIN=/usr/bin/stat\n'
+            "source <(sed -n '/^declare -A _DIR_TRUST_CACHE/,/^}/p' "
+            + os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "bin", "omarchy-dropdown-terminal")
+            + ")\n"
+            "dir_trusted /usr/bin; echo \"cold_usrbin=$?\"\n"
+            "dir_trusted /usr/bin; echo \"warm_usrbin=$?\"\n"
+            "dir_trusted /tmp; echo \"tmp=$?\"\n"
+            "dir_trusted /tmp; echo \"tmp2=$?\"\n"
+        )
+        out = terminal_run_bash(script)
+        self.assertIn("cold_usrbin=0", out)
+        self.assertIn("warm_usrbin=0", out)
+        self.assertIn("tmp=1", out)
+        self.assertIn("tmp2=1", out)
+
 
 if __name__ == "__main__":
     unittest.main()
