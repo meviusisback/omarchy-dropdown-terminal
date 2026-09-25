@@ -290,6 +290,10 @@ if hl and hl.animation then
   hl.animation({{ leaf = "specialWorkspaceOut", enabled = true, speed = 3, bezier = "easeOutQuint", style = "slidevert bottom" }})
 end
 
+-- The panel geometry below is mirrored by reposition_panel() in the plugin's
+-- CLI (PANEL_X_FRAC / PANEL_Y): this rule only runs at a window's first map,
+-- and the foot server keeps that window alive, so the CLI re-applies it on
+-- every open. Change these numbers and the CLI constants with them.
 o.window("{DROPDOWN_APP_ID}", {{
   workspace = ddws,
   float = true,

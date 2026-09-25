@@ -20,7 +20,11 @@ switch, and even a shell restart.
   motion for special workspaces (a bare `slidevert` rises from the bottom).
 - **Centered geometry** - 80% width, 45% height, just below the top bar, with
   a rounded 3px border. Geometry is expressed in `monitor_w/H` formulas, so it
-  adapts to any monitor/resolution change without reinstalling.
+  adapts to any monitor/resolution change without reinstalling. The position is
+  also re-applied on every open: Hyprland only honours a window rule at the
+  window's first map, and it recentres floating windows of a special workspace
+  when they open (which a monitor hotplug used to leave stuck), so the CLI
+  puts the panel back under the bar instead of trusting it to stay there.
 - **Click outside to dismiss** - a focus watcher hides the dropdown the moment
   it loses focus. It is **event-driven**: the watcher subscribes to Hyprland's
   event socket (`activewindow` / `activespecial`), so it costs nothing while you
