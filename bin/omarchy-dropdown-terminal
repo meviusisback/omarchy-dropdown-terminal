@@ -17,6 +17,13 @@ PLUGIN_ID="meviusisback.dropdown-terminal"
 APP_ID="org.omarchy.dropdown-terminal"
 UNIT="foot-server@dropdown-terminal.service"
 
+# Panel geometry, mirroring the `move` rule in the backend's RULES_BODY - the
+# two copies must stay in step (tests/test_backend.py fails if they drift).
+# The rule itself only runs at a window's FIRST map, so reposition_panel()
+# below re-applies these values on every open.
+PANEL_X_FRAC="0.1"    # RULES_BODY: move = { "(monitor_w*10/100)", ...
+PANEL_Y="36"          # RULES_BODY: ... , "36" }
+
 msg() { printf '%s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
@@ -362,6 +369,47 @@ pull_window_into_special() {
   return 1
 }
 
+# Re-apply the panel geometry to the dropdown window that is already mapped.
+#
+# Window rules run only at a window's FIRST map (Hyprland applies `move` and
+# `size` in DefaultFloatingAlgorithm::newTarget, gated on m_firstMap), and this
+# window outlives every hide/show because the foot server owns it - so whatever
+# position the compositor gives it later is permanent. Hyprland does change it:
+# opening a special workspace snaps any floating window whose centre is off the
+# monitor to the exact centre of the monitor (CMonitor::setSpecialWorkspace),
+# which is how a monitor hotplug left the panel sitting in the middle of the
+# screen. Re-applying the rule's own numbers on every open makes the position
+# self-healing instead of something the user has to notice and repair.
+#
+# The Lua mirrors RULES_BODY's `move = { "(monitor_w*10/100)", "36" }` (the test
+# suite fails if the two disagree), skips the dispatch when the window is
+# already where it belongs, and reads the goal position back afterwards so a
+# move that did not take is reported instead of silently swallowed.
+reposition_panel() {
+  local script out
+  script="local id = \"$APP_ID\"
+local t
+for _, w in ipairs(hl.get_windows()) do
+  if w.class == id then t = w end
+end
+if t and t.monitor then
+  local m = t.monitor
+  local logical = math.floor((((m.transform % 2) == 1) and m.height or m.width) / m.scale + 0.5)
+  local x = math.floor(logical * ${PANEL_X_FRAC} + 0.5)
+  local y = ${PANEL_Y}
+  local at = t.at
+  if not at or at.x ~= x or at.y ~= y then
+    hl.dispatch(hl.dsp.window.move({ window = t, x = x, y = y }))
+    at = t.at
+    if not at or at.x ~= x or at.y ~= y then
+      error(\"panel at \" .. tostring(at and at.x) .. \",\" .. tostring(at and at.y) .. \", want \" .. x .. \",\" .. y)
+    end
+  end
+end"
+  out="$("$HYPRCTL" eval "$script" 2>&1)" || true
+  [ "$out" = "ok" ]
+}
+
 # The entry snapshot (SNAP_VISIBLE/SNAP_COUNT/SNAP_INSPECIAL) is taken once by
 # do_toggle and shared with do_open/do_close; direct `open`/`close` take their
 # own. SNAP_SET marks it fresh for this invocation.
@@ -409,6 +457,15 @@ do_open() {
   # A mid-run monitors failure (VISIBLE=3) skips the show, as before.
   if [ "$SNAP_VISIBLE" != "3" ] && [ "$SNAP_INSPECIAL" = "1" ] && [ "$SNAP_VISIBLE" = "1" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+  fi
+
+  # Position, not just visibility: the window rules that put the panel under
+  # the bar cannot run again for this window (first map only), so re-apply
+  # them now that it exists and is on its special workspace. Best-effort on
+  # purpose - a panel in the wrong place still works, and refusing to open it
+  # would turn a cosmetic drift into a broken toggle.
+  if [ "$SNAP_COUNT" -ge 1 ] && [ "$SNAP_VISIBLE" != "3" ]; then
+    reposition_panel || true
   fi
 }
 

@@ -433,6 +433,86 @@ class BackendTest(unittest.TestCase):
         self.assertIn('dir_trusted "${real%/*}"', cli)  # resolved path's directory
         self.assertIn("READLINK_BIN", cli)
 
+    def test_cli_reapplies_the_panel_geometry_on_every_open(self):
+        # Window rules run only at a window's FIRST map (Hyprland applies move and
+        # size in DefaultFloatingAlgorithm::newTarget, gated on m_firstMap), and
+        # the foot server keeps that window alive across every hide/show - so once
+        # the compositor moves it (opening a special workspace snaps a floating
+        # window whose centre is off the monitor to the exact centre of the
+        # monitor) the rule never gets another chance. do_open must re-apply it.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        body = cli.split("do_open() {", 1)[1].split("\ndo_close()", 1)[0]
+        self.assertIn("reposition_panel || true", body, "open never re-positions")
+        # guarded: no window, or an unreadable compositor, means nothing to fix
+        self.assertIn('[ "$SNAP_COUNT" -ge 1 ]', body)
+        self.assertIn('[ "$SNAP_VISIBLE" != "3" ]', body)
+        # best-effort: a panel in the wrong place still works, the toggle must not
+        self.assertNotIn("reposition_panel &&", body)
+        # the two copies of the geometry must stay in step
+        match = re.search(
+            r'move = \{ "\(monitor_w\*(\d+)/(\d+)\)", "(\d+)" \}', backend.RULES_BODY
+        )
+        self.assertIsNotNone(match, "RULES_BODY lost the move rule the CLI mirrors")
+        assert match is not None
+        fraction = int(match.group(1)) / int(match.group(2))
+        self.assertIn('PANEL_X_FRAC="%s"' % f"{fraction:g}", cli)
+        self.assertIn('PANEL_Y="%s"' % match.group(3), cli)
+
+    def test_reposition_panel_reports_a_move_that_did_not_take(self):
+        # Drives the real function body with a stubbed hyprctl: the Lua has to
+        # name the panel window and the rule's numbers, and a compositor that
+        # answers with anything but "ok" (a refused dispatch, a position that did
+        # not stick) must fail the call instead of being read as success.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        constants = cli[cli.index("PLUGIN_ID="):cli.index("\nmsg()")]
+        start = cli.index("reposition_panel() {")
+        end = cli.index("\n}\n", start) + 3
+        function = cli[start:end]
+        shim = (
+            "set -uo pipefail\n"
+            + constants
+            + "\n"
+            'DIR=$(mktemp -d)\n'
+            'SHIM="$DIR/hyprctl"\n'
+            'LOG="$DIR/argv"\n'
+            "export LOGFILE=\"$LOG\"\n"
+            "cat > \"$SHIM\" <<'SHIMEOF'\n"
+            "#!/bin/sh\n"
+            "{ printf 'argv:'; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; } > \"$LOGFILE\"\n"
+            "printf 'ok'\n"
+            "SHIMEOF\n"
+            "chmod +x \"$SHIM\"\n"
+            "HYPRCTL=\"$SHIM\"\n"
+            + function
+            + "\n"
+            'reposition_panel; echo "rc_ok=$?"\n'
+            'cat "$LOG"\n'
+            "printf '%s\\n' '--- failure ---'\n"
+            "cat > \"$SHIM\" <<'SHIMEOF'\n"
+            "#!/bin/sh\n"
+            "printf 'error: [string \"...\"]:1: panel at 205,317, want 205,36'\n"
+            "SHIMEOF\n"
+            "chmod +x \"$SHIM\"\n"
+            'reposition_panel; echo "rc_fail=$?"\n'
+        )
+        out = terminal_run_bash(shim)
+        self.assertIn("rc_ok=0", out)
+        self.assertIn("rc_fail=1", out, "a refused move was read as success")
+        # the Lua is multi-line, so take everything up to the failure section
+        payload = out.split("argv:", 1)[1].split("--- failure ---", 1)[0]
+        self.assertTrue(payload.lstrip().startswith("[eval] "), payload[:60])
+        self.assertIn('local id = "org.omarchy.dropdown-terminal"', payload)
+        self.assertIn("hl.get_windows()", payload)
+        self.assertIn("logical * 0.1 + 0.5", payload)
+        self.assertIn("local y = 36", payload)
+        self.assertIn("hl.dsp.window.move", payload)
+        # the result is read back, not assumed
+        self.assertIn("at.x ~= x or at.y ~= y", payload)
+
     def test_socket_path_matches_the_unit_that_binds_it(self):
         # The CLI used to build "<runtime>/foot-dropdown-terminal.sock" itself and a
         # refactor dropped the filename: footclient was handed the runtime DIRECTORY
