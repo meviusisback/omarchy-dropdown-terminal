@@ -446,7 +446,9 @@ class BackendTest(unittest.TestCase):
         body = cli.split("do_open() {", 1)[1].split("\ndo_close()", 1)[0]
         self.assertIn("reposition_panel || true", body, "open never re-positions")
         # guarded: no window, or an unreadable compositor, means nothing to fix
-        self.assertIn('[ "$SNAP_COUNT" -ge 1 ]', body)
+        # the guard line as a whole: a weaker assertion on the bare token is
+        # masked by the snapshot loop's own "-ge 1" inside do_open
+        self.assertIn('[ "$SNAP_COUNT" -ge 1 ] && [ "$SNAP_VISIBLE" != "3" ]; then', body)
         self.assertIn('[ "$SNAP_VISIBLE" != "3" ]', body)
         # best-effort: a panel in the wrong place still works, the toggle must not
         self.assertNotIn("reposition_panel &&", body)
@@ -512,6 +514,10 @@ class BackendTest(unittest.TestCase):
         self.assertIn("hl.dsp.window.move", payload)
         # the result is read back, not assumed
         self.assertIn("at.x ~= x or at.y ~= y", payload)
+        # ...and a move that did not take must actually REPORT: without the
+        # error() in the reposition Lua, hyprctl answers "ok" for a panel left
+        # in the wrong place and the read-back is decorative
+        self.assertIn("panel at", payload)
 
     def test_socket_path_matches_the_unit_that_binds_it(self):
         # The CLI used to build "<runtime>/foot-dropdown-terminal.sock" itself and a
