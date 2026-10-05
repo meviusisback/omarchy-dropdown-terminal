@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "id": "meviusisback.dropdown-terminal",
   "name": "Drop-down terminal",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "meviusisback",
   "license": "MIT",
   "repository": "https://github.com/meviusisback/omarchy-dropdown-terminal",
