@@ -458,9 +458,20 @@ class BackendTest(unittest.TestCase):
         )
         self.assertIsNotNone(match, "RULES_BODY lost the move rule the CLI mirrors")
         assert match is not None
-        fraction = int(match.group(1)) / int(match.group(2))
-        self.assertIn('PANEL_X_FRAC="%s"' % f"{fraction:g}", cli)
+        self.assertIn('PANEL_X_NUM="%s"' % match.group(1), cli)
+        self.assertIn('PANEL_X_DEN="%s"' % match.group(2), cli)
         self.assertIn('PANEL_Y="%s"' % match.group(3), cli)
+        # ...and the Lua must consume them in the rule's exact op order, with
+        # the monitor origin added HERE the way Hyprland adds it when it
+        # applies the rule (t.at and the move dispatch are global coordinates)
+        self.assertIn("logical * ${PANEL_X_NUM} / ${PANEL_X_DEN}", cli)
+        self.assertIn("m.x + logical *", cli)
+        self.assertIn("m.y + ${PANEL_Y}", cli)
+        # target selection: class AND the plugin's own special workspace, so a
+        # client-spoofed class alone can never pick a foreign window
+        self.assertIn("w.workspace.name == ws", cli)
+        self.assertIn('local ws = \\"special:dropdown\\"', cli)
+        self.assertIn("special:dropdown", backend.RULES_BODY)
 
     def test_reposition_panel_reports_a_move_that_did_not_take(self):
         # Drives the real function body with a stubbed hyprctl: the Lua has to
@@ -508,9 +519,10 @@ class BackendTest(unittest.TestCase):
         payload = out.split("argv:", 1)[1].split("--- failure ---", 1)[0]
         self.assertTrue(payload.lstrip().startswith("[eval] "), payload[:60])
         self.assertIn('local id = "org.omarchy.dropdown-terminal"', payload)
+        self.assertIn('local ws = "special:dropdown"', payload)
         self.assertIn("hl.get_windows()", payload)
-        self.assertIn("logical * 0.1 + 0.5", payload)
-        self.assertIn("local y = 36", payload)
+        self.assertIn("m.x + logical * 10 / 100", payload)
+        self.assertIn("local y = m.y + 36", payload)
         self.assertIn("hl.dsp.window.move", payload)
         # the result is read back, not assumed
         self.assertIn("at.x ~= x or at.y ~= y", payload)
@@ -518,6 +530,57 @@ class BackendTest(unittest.TestCase):
         # error() in the reposition Lua, hyprctl answers "ok" for a panel left
         # in the wrong place and the read-back is decorative
         self.assertIn("panel at", payload)
+        # truncation must mirror the read-back's sc<int> on negative origins too
+        self.assertIn("(vx < 0) and math.ceil(vx) or math.floor(vx)", payload)
+        # ...and the non-ok result must be surfaced, not swallowed by `|| true`
+        self.assertIn("reposition_panel: error:", out)
+
+    def test_reposition_refuses_non_numeric_geometry_constants(self):
+        # The geometry constants are spliced into Lua source that hyprctl eval
+        # executes, so a non-numeric value must be refused BEFORE it can reach
+        # that channel. Each constant is corrupted separately: deleting any one
+        # of the three checks makes that case run the eval, which this test
+        # notices both by the exit code and by the shim never being invoked.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        constants = cli[cli.index("PLUGIN_ID="):cli.index("\nmsg()")]
+        start = cli.index("reposition_panel() {")
+        end = cli.index("\n}\n", start) + 3
+        function = cli[start:end]
+        for override in (
+            "PANEL_X_NUM='10) x()'",
+            "PANEL_X_DEN='100) x()'",
+            "PANEL_Y='36) x()'",
+        ):
+            shim = (
+                "set -uo pipefail\n"
+                + constants
+                + "\n"
+                'DIR=$(mktemp -d)\n'
+                'SHIM="$DIR/hyprctl"\n'
+                'LOG="$DIR/argv"\n'
+                "export LOGFILE=\"$LOG\"\n"
+                "cat > \"$SHIM\" <<'SHIMEOF'\n"
+                "#!/bin/sh\n"
+                "printf 'invoked\\n' >> \"$LOGFILE\"\n"
+                "printf 'ok'\n"
+                "SHIMEOF\n"
+                "chmod +x \"$SHIM\"\n"
+                "HYPRCTL=\"$SHIM\"\n"
+                + override
+                + "\n"
+                + function
+                + "\n"
+                "reposition_panel; echo \"rc=$?\"\n"
+                'if [ -s "$LOG" ]; then echo "EVAL_INVOKED"; '
+                'else echo "EVAL_NOT_INVOKED"; fi\n'
+            )
+            out = terminal_run_bash(shim)
+            self.assertIn("rc=1", out, f"{override} was not refused")
+            self.assertIn(
+                "EVAL_NOT_INVOKED", out, f"{override} reached the hyprctl eval channel"
+            )
 
     def test_socket_path_matches_the_unit_that_binds_it(self):
         # The CLI used to build "<runtime>/foot-dropdown-terminal.sock" itself and a

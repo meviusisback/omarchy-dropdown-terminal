@@ -26,15 +26,6 @@
     "allowMultiple": false,
     "defaults": {
       "keybind": "SUPER + U"
-    },
-    "schema": [
-      {
-        "key": "keybind",
-        "type": "string",
-        "label": "Keybind (informational)",
-        "defaultValue": "SUPER + U",
-        "description": "The Hyprland keybind that toggles the drop-down terminal. Set at install time; shown here for reference."
-      }
-    ]
+    }
   }
 }

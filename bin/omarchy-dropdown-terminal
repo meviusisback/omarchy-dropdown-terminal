@@ -1,6 +1,7 @@
 #!/usr/bin/bash
 # omarchy-dropdown-terminal — control the persistent drop-down terminal.
-# argv-only exec; no eval, no shell=True anywhere.
+# argv-only exec; no shell eval of external input, no shell=True anywhere.
+# The one script channel is hyprctl eval, and it carries only built-in constants.
 #
 # This CLI is started automatically (by the bar widget's keybind, by the focus
 # watcher, and by install.sh) and it may run under a minimal environment with no
@@ -20,8 +21,10 @@ UNIT="foot-server@dropdown-terminal.service"
 # Panel geometry, mirroring the `move` rule in the backend's RULES_BODY - the
 # two copies must stay in step (tests/test_backend.py fails if they drift).
 # The rule itself only runs at a window's FIRST map, so reposition_panel()
-# below re-applies these values on every open.
-PANEL_X_FRAC="0.1"    # RULES_BODY: move = { "(monitor_w*10/100)", ...
+# below re-applies these values on every open. NUM/DEN reproduce the rule's
+# exact expression `monitor_w*10/100` so both sides compute the same doubles.
+PANEL_X_NUM="10"      # RULES_BODY: move = { "(monitor_w*10/100)", ...
+PANEL_X_DEN="100"     # RULES_BODY:     ...
 PANEL_Y="36"          # RULES_BODY: ... , "36" }
 
 msg() { printf '%s\n' "$*"; }
@@ -381,22 +384,49 @@ pull_window_into_special() {
 # screen. Re-applying the rule's own numbers on every open makes the position
 # self-healing instead of something the user has to notice and repair.
 #
-# The Lua mirrors RULES_BODY's `move = { "(monitor_w*10/100)", "36" }` (the test
-# suite fails if the two disagree), skips the dispatch when the window is
-# already where it belongs, and reads the goal position back afterwards so a
-# move that did not take is reported instead of silently swallowed.
+# The Lua mirrors RULES_BODY's `move = { "(monitor_w*10/100)", "36" }` (the
+# test suite fails if the two disagree): the rule's values are MONITOR-LOCAL
+# and Hyprland adds the monitor origin when it applies them
+# (windowGeometry = COMPUTED + MONITOR_POS), while `t.at` and a non-relative
+# hl.dsp.window.move({x, y}) are GLOBAL - so the Lua adds m.x/m.y itself and
+# truncates toward zero the way the read-back (sc<int>) does. The window is
+# matched by class AND the plugin's own special workspace, first match wins
+# (a client-spoofed class alone must never pick a foreign window); the
+# dispatch is skipped when the window is already where it belongs; and a move
+# that did not take is printed to stderr, which is the only place this
+# best-effort call site (`|| true` in do_open) can surface it.
 reposition_panel() {
   local script out
+  # These constants are spliced into the Lua source below and executed by
+  # hyprctl eval: refuse anything but digits before it can reach that channel
+  # (tests fail if any of the three checks is removed).
+  case "$PANEL_X_NUM" in ''|*[!0-9]*)
+    printf '%s\n' "reposition_panel: PANEL_X_NUM is not a positive integer, skipping" >&2
+    return 1 ;;
+  esac
+  case "$PANEL_X_DEN" in ''|*[!0-9]*)
+    printf '%s\n' "reposition_panel: PANEL_X_DEN is not a positive integer, skipping" >&2
+    return 1 ;;
+  esac
+  case "$PANEL_Y" in ''|*[!0-9]*)
+    printf '%s\n' "reposition_panel: PANEL_Y is not a positive integer, skipping" >&2
+    return 1 ;;
+  esac
   script="local id = \"$APP_ID\"
+local ws = \"special:dropdown\"
 local t
 for _, w in ipairs(hl.get_windows()) do
-  if w.class == id then t = w end
+  if w.class == id and w.workspace and w.workspace.name == ws then
+    t = w
+    break
+  end
 end
 if t and t.monitor then
   local m = t.monitor
-  local logical = math.floor((((m.transform % 2) == 1) and m.height or m.width) / m.scale + 0.5)
-  local x = math.floor(logical * ${PANEL_X_FRAC} + 0.5)
-  local y = ${PANEL_Y}
+  local logical = (((m.transform % 2) == 1) and m.height or m.width) / m.scale
+  local vx = m.x + logical * ${PANEL_X_NUM} / ${PANEL_X_DEN}
+  local x = (vx < 0) and math.ceil(vx) or math.floor(vx)
+  local y = m.y + ${PANEL_Y}
   local at = t.at
   if not at or at.x ~= x or at.y ~= y then
     hl.dispatch(hl.dsp.window.move({ window = t, x = x, y = y }))
@@ -407,7 +437,9 @@ if t and t.monitor then
   end
 end"
   out="$("$HYPRCTL" eval "$script" 2>&1)" || true
-  [ "$out" = "ok" ]
+  [ "$out" = "ok" ] && return 0
+  printf '%s\n' "reposition_panel: $out" >&2
+  return 1
 }
 
 # The entry snapshot (SNAP_VISIBLE/SNAP_COUNT/SNAP_INSPECIAL) is taken once by

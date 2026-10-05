@@ -19,12 +19,15 @@ switch, and even a shell restart.
   **drops in from the top** and retracts upward, instead of Hyprland's default
   motion for special workspaces (a bare `slidevert` rises from the bottom).
 - **Centered geometry** - 80% width, 45% height, just below the top bar, with
-  a rounded 3px border. Geometry is expressed in `monitor_w/H` formulas, so it
-  adapts to any monitor/resolution change without reinstalling. The position is
-  also re-applied on every open: Hyprland only honours a window rule at the
-  window's first map, and it recentres floating windows of a special workspace
-  when they open (which a monitor hotplug used to leave stuck), so the CLI
-  puts the panel back under the bar instead of trusting it to stay there.
+  a rounded 3px border. Geometry is expressed in `monitor_w/H` formulas, so
+  the rule lands relative to whichever monitor the window first maps on.
+  Hyprland only honours a window rule at the window's first map, and it
+  recentres floating windows of a special workspace when they open (which a
+  monitor hotplug used to leave stuck), so the CLI re-applies the panel's
+  position on every open - putting it back under the bar instead of trusting
+  it to stay there. Size still comes from the first map: after a resolution
+  change, run `omarchy-dropdown-terminal kill` and reopen so a fresh window
+  picks up the new size.
 - **Click outside to dismiss** - a focus watcher hides the dropdown the moment
   it loses focus. It is **event-driven**: the watcher subscribes to Hyprland's
   event socket (`activewindow` / `activespecial`), so it costs nothing while you
@@ -226,7 +229,7 @@ Host-static - no compositor needed, and hermetic (the suite repoints `HOME` and
 records instead of running `systemctl`):
 
 ```bash
-python3 tests/test_backend.py        # 53 - config writes, keybind refresh, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 55 - config writes, keybind refresh, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
 python3 tests/test_focus_watcher.py  # 41 - event state machine, path validation, state file, socket
 ```
