@@ -1,7 +1,10 @@
 #!/usr/bin/bash
 # omarchy-dropdown-terminal — control the persistent drop-down terminal.
 # argv-only exec; no shell eval of external input, no shell=True anywhere.
-# The one script channel is hyprctl eval, and it carries only built-in constants.
+# Constructed script reaches the compositor only through hyprctl eval (the
+# geometry constants are validated to digits first) and hyprctl dispatch
+# hl.* expressions (window addresses regex-validated as hex) - plugin
+# constants and validated data only, never raw external input.
 #
 # This CLI is started automatically (by the bar widget's keybind, by the focus
 # watcher, and by install.sh) and it may run under a minimal environment with no
@@ -22,7 +25,8 @@ UNIT="foot-server@dropdown-terminal.service"
 # two copies must stay in step (tests/test_backend.py fails if they drift).
 # The rule itself only runs at a window's FIRST map, so reposition_panel()
 # below re-applies these values on every open. NUM/DEN reproduce the rule's
-# exact expression `monitor_w*10/100` so both sides compute the same doubles.
+# exact expression `monitor_w*10/100` against the same rounded logical size
+# (m_size = round(pixel/scale)), so both sides compute the same value.
 PANEL_X_NUM="10"      # RULES_BODY: move = { "(monitor_w*10/100)", ...
 PANEL_X_DEN="100"     # RULES_BODY:     ...
 PANEL_Y="36"          # RULES_BODY: ... , "36" }
@@ -423,7 +427,8 @@ for _, w in ipairs(hl.get_windows()) do
 end
 if t and t.monitor then
   local m = t.monitor
-  local logical = (((m.transform % 2) == 1) and m.height or m.width) / m.scale
+  local raw = (((m.transform % 2) == 1) and m.height or m.width) / m.scale
+  local logical = math.floor(raw + 0.5)
   local vx = m.x + logical * ${PANEL_X_NUM} / ${PANEL_X_DEN}
   local x = (vx < 0) and math.ceil(vx) or math.floor(vx)
   local y = m.y + ${PANEL_Y}

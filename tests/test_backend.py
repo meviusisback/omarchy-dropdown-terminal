@@ -521,6 +521,8 @@ class BackendTest(unittest.TestCase):
         self.assertIn('local id = "org.omarchy.dropdown-terminal"', payload)
         self.assertIn('local ws = "special:dropdown"', payload)
         self.assertIn("hl.get_windows()", payload)
+        # logical size is rounded to the compositor's m_size = round(pixel/scale)
+        self.assertIn("math.floor(raw + 0.5)", payload)
         self.assertIn("m.x + logical * 10 / 100", payload)
         self.assertIn("local y = m.y + 36", payload)
         self.assertIn("hl.dsp.window.move", payload)
