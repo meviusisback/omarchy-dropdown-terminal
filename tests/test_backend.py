@@ -532,8 +532,9 @@ class BackendTest(unittest.TestCase):
         # error() in the reposition Lua, hyprctl answers "ok" for a panel left
         # in the wrong place and the read-back is decorative
         self.assertIn("panel at", payload)
-        # truncation must mirror the read-back's sc<int> on negative origins too
-        self.assertIn("(vx < 0) and math.ceil(vx) or math.floor(vx)", payload)
+        # rounding must mirror the compositor's CBox::round (half away from
+        # zero, glibc round) on negative origins too - trunc put those 1px off
+        self.assertIn("(vx < 0) and math.ceil(vx - 0.5) or math.floor(vx + 0.5)", payload)
         # ...and the non-ok result must be surfaced, not swallowed by `|| true`
         self.assertIn("reposition_panel: error:", out)
 

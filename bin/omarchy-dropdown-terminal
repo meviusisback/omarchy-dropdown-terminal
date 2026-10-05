@@ -393,7 +393,9 @@ pull_window_into_special() {
 # and Hyprland adds the monitor origin when it applies them
 # (windowGeometry = COMPUTED + MONITOR_POS), while `t.at` and a non-relative
 # hl.dsp.window.move({x, y}) are GLOBAL - so the Lua adds m.x/m.y itself and
-# truncates toward zero the way the read-back (sc<int>) does. The window is
+# rounds the result half away from zero, the way the compositor rounds the box
+# the window lands on (setPositionGlobal -> CBox::round -> glibc round); the
+# read-back then sees exactly this integer. The window is
 # matched by class AND the plugin's own special workspace, first match wins
 # (a client-spoofed class alone must never pick a foreign window); the
 # dispatch is skipped when the window is already where it belongs; and a move
@@ -430,7 +432,7 @@ if t and t.monitor then
   local raw = (((m.transform % 2) == 1) and m.height or m.width) / m.scale
   local logical = math.floor(raw + 0.5)
   local vx = m.x + logical * ${PANEL_X_NUM} / ${PANEL_X_DEN}
-  local x = (vx < 0) and math.ceil(vx) or math.floor(vx)
+  local x = (vx < 0) and math.ceil(vx - 0.5) or math.floor(vx + 0.5)
   local y = m.y + ${PANEL_Y}
   local at = t.at
   if not at or at.x ~= x or at.y ~= y then
