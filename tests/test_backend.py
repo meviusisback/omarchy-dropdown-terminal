@@ -617,19 +617,51 @@ class BackendTest(unittest.TestCase):
         with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
             cli = handle.read()
         body = cli.split("do_open() {", 1)[1].split("\ndo_close()", 1)[0]
-        # the caller uses the two-step placer, not the bare focused pull
-        self.assertIn("place_panel_in_special || true", body)
-        self.assertNotIn("pull_window_into_special || true", body)
+        fresh = body.split('if [ "$SNAP_COUNT" -eq 0 ]; then', 1)[1].split("\n  else\n", 1)[0]
+        opened = body.split("\n  else\n", 1)[1].split("\n  fi\n", 1)[0]
+        # fresh path: the two-step placer (pull + blind eval allowed here only,
+        # because entry COUNT=0 proves no pre-existing class match)
+        self.assertIn("place_panel_in_special || true", fresh)
+        # already-open path: focused pull ONLY - a blind class move must never
+        # run when pre-existing windows may carry our class (spoof widening)
+        self.assertIn("pull_window_into_special || true", opened)
+        self.assertNotIn("place_panel_in_special", opened)
+        # both paths report instead of skipping the reveal silently
+        self.assertIn("do_open: window not in special:dropdown, not showing", body)
         start = cli.index("place_panel_in_special() {")
         fn = cli[start:cli.index("\n}\n", start) + 3]
         # step 1: the focused pull; step 2: eval move BY OBJECT (works even
-        # when focus was stolen during the post-map sleep)
+        # when focus was stolen during the post-map sleep)...
         self.assertIn("pull_window_into_special", fn)
         self.assertIn(
             'hl.dsp.window.move({ window = t, workspace = \\"special:dropdown\\" })', fn
         )
+        # ...read back after the move (hyprctl "ok" only means the Lua ran)...
+        self.assertIn("window not placed", fn)
         # ...and a failure of either step is reported, not swallowed
         self.assertIn("place_panel_in_special: $out", fn)
+
+    def test_active_is_panel_rejects_non_dict_workspace(self):
+        # The two-condition verifier must fail CLOSED with exit 1 and NO
+        # traceback on any shape it did not expect - mirroring snapshot()'s
+        # catch-all (an uncaught AttributeError would spew a traceback onto the
+        # keybind's stderr on every retry).
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        start = cli.index("active_is_panel() {")
+        fn = cli[start:cli.index("\n}\n", start) + 3]
+        code = fn.split(" -c '", 1)[1].rsplit("'\n}", 1)[0]
+        for payload in (
+            '{"class":"org.omarchy.dropdown-terminal","workspace":"special:dropdown"}',
+            '{"class":"org.omarchy.dropdown-terminal","workspace":{"name":123}}',
+            "not json",
+        ):
+            p = subprocess.run(
+                [sys.executable, "-c", code], input=payload.encode(), capture_output=True
+            )
+            self.assertEqual(p.returncode, 1, payload)
+            self.assertNotIn(b"Traceback", p.stderr, payload)
 
     def test_do_open_ensures_focus_after_show(self):
         # Focus must be reasserted and VERIFIED at open: map-focus (fresh) and

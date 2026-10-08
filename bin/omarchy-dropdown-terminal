@@ -339,12 +339,12 @@ if len(raw) > MAX:
     sys.exit(1)
 try:
     d = json.loads(raw) if raw.strip() not in (b"", b"{}") else {}
-except (json.JSONDecodeError, TypeError):
+    d = d or {}
+    ws = d.get("workspace") or {}
+    sys.exit(0 if d.get("class") == "org.omarchy.dropdown-terminal"
+             and ws.get("name") == "special:dropdown" else 1)
+except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
     sys.exit(1)
-d = d or {}
-ws = d.get("workspace") or {}
-sys.exit(0 if d.get("class") == "org.omarchy.dropdown-terminal"
-         and ws.get("name") == "special:dropdown" else 1)
 '
 }
 
@@ -419,6 +419,9 @@ pull_window_into_special() {
 # so placement is always verified against real state - and when neither step
 # works the failure is LOUD (stderr) instead of a silent no-op that would leave
 # the show guard skipping the reveal forever (the a08e816 stranding shape).
+# CALLED FROM THE FRESH PATH ONLY: entry COUNT=0 proves no pre-existing window
+# carries our class, so the class-only match below can only find our own spawn;
+# the already-open path keeps the focused pull (never a blind class move).
 place_panel_in_special() {
   # 1) The focused-move path (also unpins): covers the common fresh-spawn case,
   #    where the new window just took focus.
@@ -444,6 +447,9 @@ if not t then
 end
 if not t.workspace or t.workspace.name ~= \"special:dropdown\" then
   hl.dispatch(hl.dsp.window.move({ window = t, workspace = \"special:dropdown\" }))
+  if not t.workspace or t.workspace.name ~= \"special:dropdown\" then
+    error(\"window not placed\")
+  end
 end" 2>&1)" || true
   if [ "$out" = "ok" ]; then
     return 0
@@ -544,10 +550,10 @@ do_open() {
     # animation ran before foot had drawn its first frame, so the panel popped
     # in (first painted frame = prompt at the top-left) instead of dropping.
     # a08e816 introduced show-first because a spawn while the special was
-    # hidden could miss the workspace rule (with the then-pinned rule) and
-    # strand on a normal workspace; place_panel_in_special below recovers
-    # BEFORE the show, does not depend on focus, and fails loud - a stranded
-    # window is placed or reported, never silently left behind the show.
+    # hidden could miss the workspace rule and strand on a normal workspace
+    # (the then-pinned rule made that escape unkillable); place FIRST - before
+    # the paint wait, so a missed rule is yanked back at once - with a
+    # recovery that does not depend on focus and fails loud, never silent.
     spawn_client
     local i
     for i in 1 2 3 4 5; do
@@ -555,6 +561,10 @@ do_open() {
       [ "$SNAP_COUNT" -ge 1 ] && break
       "$SLEEP" 0.2
     done
+    if [ "$SNAP_INSPECIAL" != "1" ]; then
+      place_panel_in_special || true
+      parse_snapshot "$(snapshot)"
+    fi
     # Let the fresh window map and commit its first frame (measured ~150 ms to
     # a painted panel; 0.4 keeps margin).
     "$SLEEP" 0.4
@@ -564,15 +574,20 @@ do_open() {
       "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
       "$SLEEP" 0.2
     fi
-  fi
-  # Place (re-query first: the entry snapshot is stale when no spawn happened
-  # above, and a just-spawned window may have missed the workspace rule).
-  if [ "$SNAP_COUNT" -gt 0 ]; then
     parse_snapshot "$(snapshot)"
+    if [ "$SNAP_INSPECIAL" != "1" ]; then
+      # Focused-move only on this path: the blind class-match eval is reserved
+      # for the fresh path, where entry COUNT=0 proves no pre-existing window
+      # carries our class, so its match can only be our own spawn.
+      pull_window_into_special || true
+      parse_snapshot "$(snapshot)"
+      if [ "$SNAP_INSPECIAL" != "1" ]; then
+        printf '%s\n' "do_open: window not in special:dropdown, not showing" >&2
+      fi
+    fi
   fi
-  if [ "$SNAP_INSPECIAL" != "1" ]; then
-    place_panel_in_special || true
-    # Re-query before the show guard: a just-placed window must not stay hidden.
+  # Re-query before the show guard: the state may have moved during the waits.
+  if [ "$SNAP_COUNT" -gt 0 ]; then
     parse_snapshot "$(snapshot)"
   fi
   # Show it once it is where it belongs (guarded against double-toggle; for a
