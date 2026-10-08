@@ -327,6 +327,44 @@ sys.exit(0 if (d or {}).get("class") == "org.omarchy.dropdown-terminal" else 1)
 '
 }
 
+# Two-condition active check: class AND workspace. focus_panel verifies with
+# this, not with the class-only active_is_dropdown - a class-spoofed window on
+# another workspace must never pass focus verification.
+active_is_panel() {
+  "$HYPRCTL" activewindow -j | "$PYTHON" -I -E -S -c '
+import json, sys
+MAX = 262144
+raw = sys.stdin.buffer.read(MAX + 1)
+if len(raw) > MAX:
+    sys.exit(1)
+try:
+    d = json.loads(raw) if raw.strip() not in (b"", b"{}") else {}
+    d = d or {}
+    ws = d.get("workspace") or {}
+    sys.exit(0 if d.get("class") == "org.omarchy.dropdown-terminal"
+             and ws.get("name") == "special:dropdown" else 1)
+except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
+    sys.exit(1)
+'
+}
+
+# The panel must hold the keyboard the moment the dropdown opens. Map-focus
+# (fresh spawn) and the workspace-open focus path (later opens) are both
+# indirect, so reassert: focus the special's workspace, then VERIFY class AND
+# workspace together, retry twice, and report on stderr when it did not take -
+# same reassert-and-verify pattern as reposition_panel.
+focus_panel() {
+  local i
+  active_is_panel && return 0
+  for i in 1 2; do
+    "$HYPRCTL" dispatch 'hl.dsp.focus({ workspace = "special:dropdown" })' >/dev/null 2>&1 || true
+    "$SLEEP" 0.1
+    active_is_panel && return 0
+  done
+  printf '%s\n' "focus_panel: dropdown is not focused" >&2
+  return 1
+}
+
 # Print "ADDRESS PINNED" for the first dropdown window ("" if none).
 dropdown_pin_state() {
   "$HYPRCTL" clients -j | "$PYTHON" -I -E -S -c '
@@ -373,6 +411,50 @@ pull_window_into_special() {
     [ "$SNAP_INSPECIAL" = "1" ] && return 0
     "$SLEEP" 0.2
   done
+  return 1
+}
+
+# Put the dropdown window into special:dropdown when the normal path could not.
+# Two steps, ordered by intrusiveness; the caller re-queries the snapshot after,
+# so placement is always verified against real state - and when neither step
+# works the failure is LOUD (stderr) instead of a silent no-op that would leave
+# the show guard skipping the reveal forever (the a08e816 stranding shape).
+# CALLED FROM THE FRESH PATH ONLY: entry COUNT=0 proves no pre-existing window
+# carries our class, so the class-only match below can only find our own spawn;
+# the already-open path keeps the focused pull (never a blind class move).
+place_panel_in_special() {
+  # 1) The focused-move path (also unpins): covers the common fresh-spawn case,
+  #    where the new window just took focus.
+  if pull_window_into_special; then
+    return 0
+  fi
+  # 2) Eval fallback: move by window OBJECT, which the engine supports for a
+  #    window that is NOT focused (focus may have been stolen during the
+  #    post-map sleep). Class-only match on purpose: a window stranded outside
+  #    the special is by definition not matched with workspace, and this is the
+  #    same class-only family as pull/snapshot (accepted residual).
+  local out
+  out="$("$HYPRCTL" eval "local id = \"$APP_ID\"
+local t
+for _, w in ipairs(hl.get_windows()) do
+  if w.class == id then
+    t = w
+    break
+  end
+end
+if not t then
+  error(\"no dropdown window to place\")
+end
+if not t.workspace or t.workspace.name ~= \"special:dropdown\" then
+  hl.dispatch(hl.dsp.window.move({ window = t, workspace = \"special:dropdown\" }))
+  if not t.workspace or t.workspace.name ~= \"special:dropdown\" then
+    error(\"window not placed\")
+  end
+end" 2>&1)" || true
+  if [ "$out" = "ok" ]; then
+    return 0
+  fi
+  printf '%s\n' "place_panel_in_special: $out" >&2
   return 1
 }
 
@@ -458,16 +540,20 @@ do_open() {
     parse_snapshot "$(snapshot)"
     SNAP_SET=1
   fi
-  # Show the special workspace FIRST so a fresh client's workspace rule has
-  # a visible target (spawning while it is hidden is what stranded windows).
   if [ "$SNAP_VISIBLE" = "3" ]; then
     die "cannot read the compositor state (unusable monitor list); refusing to toggle"
   fi
-  if [ "$SNAP_VISIBLE" = "1" ]; then
-    "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
-    "$SLEEP" 0.2
-  fi
   if [ "$SNAP_COUNT" -eq 0 ]; then
+    # Fresh open: spawn FIRST, show afterwards. The workspace slide-IN only
+    # reads well over an already-painted window: with the old show-first order
+    # the slide played over an EMPTY workspace and the window's own map
+    # animation ran before foot had drawn its first frame, so the panel popped
+    # in (first painted frame = prompt at the top-left) instead of dropping.
+    # a08e816 introduced show-first because a spawn while the special was
+    # hidden could miss the workspace rule and strand on a normal workspace
+    # (the then-pinned rule made that escape unkillable); place FIRST - before
+    # the paint wait, so a missed rule is yanked back at once - with a
+    # recovery that does not depend on focus and fails loud, never silent.
     spawn_client
     local i
     for i in 1 2 3 4 5; do
@@ -475,27 +561,41 @@ do_open() {
       [ "$SNAP_COUNT" -ge 1 ] && break
       "$SLEEP" 0.2
     done
-    # Let the fresh window map and take focus.
+    if [ "$SNAP_INSPECIAL" != "1" ]; then
+      place_panel_in_special || true
+      parse_snapshot "$(snapshot)"
+    fi
+    # Let the fresh window map and commit its first frame (measured ~150 ms to
+    # a painted panel; 0.4 keeps margin).
     "$SLEEP" 0.4
+  else
+    # The window already exists (and is painted): show it first, as always.
+    if [ "$SNAP_VISIBLE" = "1" ]; then
+      "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+      "$SLEEP" 0.2
+    fi
+    parse_snapshot "$(snapshot)"
+    if [ "$SNAP_INSPECIAL" != "1" ]; then
+      # Focused-move only on this path: the blind class-match eval is reserved
+      # for the fresh path, where entry COUNT=0 proves no pre-existing window
+      # carries our class, so its match can only be our own spawn.
+      pull_window_into_special || true
+      parse_snapshot "$(snapshot)"
+      if [ "$SNAP_INSPECIAL" != "1" ]; then
+        printf '%s\n' "do_open: window not in special:dropdown, not showing" >&2
+      fi
+    fi
   fi
-  # A window that spawned while the rules could not place it may be stranded
-  # on a normal workspace; pull it into the special workspace. Re-query first
-  # when no spawn happened above: the entry snapshot is stale by now and the
-  # old code queried fresh here too.
+  # Re-query before the show guard: the state may have moved during the waits.
   if [ "$SNAP_COUNT" -gt 0 ]; then
     parse_snapshot "$(snapshot)"
   fi
-  if [ "$SNAP_INSPECIAL" != "1" ]; then
-    pull_window_into_special || true
-    # The pull may have moved the window: the entry snapshot's INSPECIAL is
-    # stale, so re-query before the show guard below (a just-placed window
-    # would otherwise stay hidden).
-    parse_snapshot "$(snapshot)"
-  fi
-  # Show it once it is where it belongs (guarded against double-toggle).
+  # Show it once it is where it belongs (guarded against double-toggle; for a
+  # fresh open this IS the show, played over the already-painted window).
   # A mid-run monitors failure (VISIBLE=3) skips the show, as before.
   if [ "$SNAP_VISIBLE" != "3" ] && [ "$SNAP_INSPECIAL" = "1" ] && [ "$SNAP_VISIBLE" = "1" ]; then
     "$HYPRCTL" dispatch 'hl.dsp.workspace.toggle_special("dropdown")' >/dev/null
+    parse_snapshot "$(snapshot)"
   fi
 
   # Position, not just visibility: the window rules that put the panel under
@@ -505,6 +605,13 @@ do_open() {
   # would turn a cosmetic drift into a broken toggle.
   if [ "$SNAP_COUNT" -ge 1 ] && [ "$SNAP_VISIBLE" != "3" ]; then
     reposition_panel || true
+  fi
+
+  # Focus: map-focus (fresh open) and the workspace-open path (later opens)
+  # are both indirect, so reassert and VERIFY - the panel must hold the
+  # keyboard the moment it is shown, or typing lands on the previous window.
+  if [ "$SNAP_INSPECIAL" = "1" ] && [ "$SNAP_VISIBLE" = "0" ]; then
+    focus_panel || true
   fi
 }
 

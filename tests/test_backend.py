@@ -585,6 +585,108 @@ class BackendTest(unittest.TestCase):
                 "EVAL_NOT_INVOKED", out, f"{override} reached the hyprctl eval channel"
             )
 
+    def test_do_open_spawns_before_show_on_fresh_open(self):
+        # First-open order: the window must exist, be placed and be painted
+        # BEFORE the workspace slide plays. The old show-first order consumed
+        # the slide-IN on an empty workspace and the window's map animation ran
+        # on an unpainted surface, so the panel popped in at the top instead of
+        # dropping (and its first painted frame was just the prompt, top-left).
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        body = cli.split("do_open() {", 1)[1].split("\ndo_close()", 1)[0]
+        # the fresh branch exists...
+        self.assertIn('if [ "$SNAP_COUNT" -eq 0 ]; then', body)
+        # ...and comes before ANY show: spawn precedes the first toggle
+        self.assertLess(body.index("spawn_client"), body.index("toggle_special"))
+        # the fresh branch itself shows nothing (the guarded show is the only one)
+        fresh = body.split('if [ "$SNAP_COUNT" -eq 0 ]; then', 1)[1].split("\n  else\n", 1)[0]
+        self.assertNotIn("toggle_special", fresh)
+        # the map poll stays bounded (a failed map must not hang the keybind)
+        self.assertIn("for i in 1 2 3 4 5", body)
+        # the show stays guarded on placement + hidden state
+        self.assertIn(
+            '[ "$SNAP_INSPECIAL" = "1" ] && [ "$SNAP_VISIBLE" = "1" ]; then', body
+        )
+
+    def test_placement_failure_is_not_silent(self):
+        # The show guard skips when the window is not in the special, so a
+        # failed placement must be LOUD (stderr) - never a silent no-op that
+        # leaves the reveal permanently skipped (the a08e816 stranding shape).
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        body = cli.split("do_open() {", 1)[1].split("\ndo_close()", 1)[0]
+        fresh = body.split('if [ "$SNAP_COUNT" -eq 0 ]; then', 1)[1].split("\n  else\n", 1)[0]
+        opened = body.split("\n  else\n", 1)[1].split("\n  fi\n", 1)[0]
+        # fresh path: the two-step placer (pull + blind eval allowed here only,
+        # because entry COUNT=0 proves no pre-existing class match)
+        self.assertIn("place_panel_in_special || true", fresh)
+        # already-open path: focused pull ONLY - a blind class move must never
+        # run when pre-existing windows may carry our class (spoof widening)
+        self.assertIn("pull_window_into_special || true", opened)
+        self.assertNotIn("place_panel_in_special", opened)
+        # both paths report instead of skipping the reveal silently
+        self.assertIn("do_open: window not in special:dropdown, not showing", body)
+        start = cli.index("place_panel_in_special() {")
+        fn = cli[start:cli.index("\n}\n", start) + 3]
+        # step 1: the focused pull; step 2: eval move BY OBJECT (works even
+        # when focus was stolen during the post-map sleep)...
+        self.assertIn("pull_window_into_special", fn)
+        self.assertIn(
+            'hl.dsp.window.move({ window = t, workspace = \\"special:dropdown\\" })', fn
+        )
+        # ...read back after the move (hyprctl "ok" only means the Lua ran)...
+        self.assertIn("window not placed", fn)
+        # ...and a failure of either step is reported, not swallowed
+        self.assertIn("place_panel_in_special: $out", fn)
+
+    def test_active_is_panel_rejects_non_dict_workspace(self):
+        # The two-condition verifier must fail CLOSED with exit 1 and NO
+        # traceback on any shape it did not expect - mirroring snapshot()'s
+        # catch-all (an uncaught AttributeError would spew a traceback onto the
+        # keybind's stderr on every retry).
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        start = cli.index("active_is_panel() {")
+        fn = cli[start:cli.index("\n}\n", start) + 3]
+        code = fn.split(" -c '", 1)[1].rsplit("'\n}", 1)[0]
+        for payload in (
+            '{"class":"org.omarchy.dropdown-terminal","workspace":"special:dropdown"}',
+            '{"class":"org.omarchy.dropdown-terminal","workspace":{"name":123}}',
+            "not json",
+        ):
+            p = subprocess.run(
+                [sys.executable, "-c", code], input=payload.encode(), capture_output=True
+            )
+            self.assertEqual(p.returncode, 1, payload)
+            self.assertNotIn(b"Traceback", p.stderr, payload)
+
+    def test_do_open_ensures_focus_after_show(self):
+        # Focus must be reasserted and VERIFIED at open: map-focus (fresh) and
+        # the workspace-open path (later opens) are both indirect - without
+        # this, typing after a first open lands on the previous window.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            cli = handle.read()
+        body = cli.split("do_open() {", 1)[1].split("\ndo_close()", 1)[0]
+        self.assertIn("focus_panel || true", body)
+        # runs last: position first, focus after
+        self.assertLess(
+            body.index("reposition_panel || true"), body.index("focus_panel || true")
+        )
+        # guarded: only when the panel is placed AND the special is open
+        self.assertIn('[ "$SNAP_INSPECIAL" = "1" ] && [ "$SNAP_VISIBLE" = "0" ]; then', body)
+        # the dispatch carries the literal workspace (no interpolation)
+        self.assertIn('hl.dsp.focus({ workspace = "special:dropdown" })', cli)
+        # verification is TWO conditions: class AND workspace
+        start = cli.index("active_is_panel() {")
+        fn = cli[start:cli.index("\n}\n", start) + 3]
+        self.assertIn('ws.get("name") == "special:dropdown"', fn)
+        # ...and failure is loud
+        self.assertIn("focus_panel: dropdown is not focused", cli)
+
     def test_socket_path_matches_the_unit_that_binds_it(self):
         # The CLI used to build "<runtime>/foot-dropdown-terminal.sock" itself and a
         # refactor dropped the filename: footclient was handed the runtime DIRECTORY
