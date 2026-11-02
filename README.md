@@ -20,10 +20,10 @@ A scratch terminal should be one keypress away, on every workspace, with nothing
 - **Persistent session** — powered by a `foot` terminal *server* (systemd user unit). Hiding the dropdown never kills your session; only logout or an explicit kill does. If the server ever dies, the next toggle self-heals it.
 - **Real drop animation, from the top** — the terminal lives on its own special workspace at the top edge; toggling plays Hyprland's `specialWorkspace` animation (easeOutQuint) with the direction pinned explicitly, so the panel **drops in from the top** and retracts upward.
 - **Centered geometry** — 80% width, 45% height, just below the top bar, with a rounded 3px border. Geometry is expressed in `monitor_w/H` formulas, so the rule lands relative to whichever monitor the window first maps on. The CLI re-applies the panel's position on every open; after a resolution change, run `omarchy-dropdown-terminal kill` and reopen so a fresh window picks up the new size.
-- **Click outside to dismiss** — a focus watcher hides the dropdown the moment it loses focus. It is **event-driven**: it subscribes to Hyprland's event socket (`activewindow` / `activespecial`), so it costs nothing while you work instead of polling. Dismissal is click-based: the plugin sets `input:follow_mouse = 0` and `float_switch_override_focus = 0` so moving the mouse never steals focus, and `input:special_fallthrough` lets your click reach the window underneath.
+- **Click outside to dismiss** — a focus watcher hides the dropdown the moment it loses focus. It is **event-driven**: it subscribes to Hyprland's event socket (`activewindow` / `activespecial`), so it costs nothing while you work instead of polling the compositor (if the socket is missing or stale it falls back to a 2 s poll). Dismissal is click-based: the plugin sets `input:follow_mouse = 0` and `float_switch_override_focus = 0` so moving the mouse never steals focus, and `input:special_fallthrough` lets your click reach the window underneath.
 - **Bar widget** — shows terminal state at a glance (accent = shown). Left click toggles, right click opens a small menu (show/hide, kill server). The state is event-driven too: the watcher publishes it to a small file the widget watches, so there is no periodic status poll.
 - **IPC control** — `omarchy-shell shell toggle meviusisback.dropdown-terminal`, plus `open`, `close`, `kill` and `status` methods.
-- **Clean install/uninstall** — one marker-anchored block in your Hyprland config, one line, one systemd unit. Uninstall removes every trace.
+- **Clean install/uninstall** — one marker-anchored block in your Hyprland config, one line, one systemd unit. Uninstall removes the keybind block, the window rules, the hook line and the systemd unit, and restores any config file it had backed up; the single-instance lock file and the runtime state file are left in place on purpose, because unlinking a lock another process may still hold would let two watchers run at once.
 
 ## Install
 
@@ -70,7 +70,7 @@ uninstall remove everything the plugin installed
 - **python3** and **bash** at their absolute system paths (`/usr/bin/python3`, `/usr/bin/bash`) — standard library only; the backend, the watcher and the CLI use no third-party packages. Every tool the plugin runs is resolved to a validated absolute path, never through `PATH`, so a layout that keeps them elsewhere is not supported.
 - **omarchy-shell** — for the bar widget and the `omarchy-shell shell toggle meviusisback.dropdown-terminal` IPC method.
 
-Everything runs in your own user session: no network access, no root, no long-lived daemon beyond the foot server unit.
+Everything runs in your own user session: no network access, no root, and no systemd service beyond the user unit `foot-server@dropdown-terminal.service`. The bar widget additionally starts one small `focus_watcher` helper. It publishes the dropdown's visibility to the bar and hides the dropdown when focus leaves it, by calling the CLI's own `close` path; the widget stops it when it is destroyed, so a shell that dies without running its destructor can leave it holding the single-instance lock until you kill it.
 
 ## Configuration
 
