@@ -116,20 +116,32 @@ class BackendTest(unittest.TestCase):
     def test_rules_body_reasserts_follow_mouse_after_omarchy_resets_it(self):
         # Regression: Omarchy's workspace-modes.lua caches input.follow_mouse
         # when it loads (before this file, so Omarchy's default 1) and writes
-        # it back on workspace/monitor events. Without these listeners the
-        # first event after startup turned hover-to-focus back on and moving
-        # the pointer out of the dropdown closed it. The generated rules must
-        # install handlers that put follow_mouse = 0 back.
+        # it back from update_input(). That runs on workspace/monitor events
+        # AND from the direct o.workspace_mode() call behind SUPER+L, which
+        # emits no workspace event; showing the dropdown emits
+        # workspace.special_active, not workspace.active. Without all four
+        # listeners hover-to-focus came back and moving the pointer out of the
+        # dropdown closed it. The handler must also be guarded on the current
+        # value: a runtime hl.config schedules config.props_refreshed, so an
+        # unguarded re-assert would loop.
         self.assertIn("follow_mouse = 0", backend.RULES_BODY)
         self.assertIn("float_switch_override_focus = 0", backend.RULES_BODY)
-        for event in ("workspace.active", "monitor.focused"):
+        for event in (
+            "workspace.active",
+            "monitor.focused",
+            "workspace.special_active",
+            "config.props_refreshed",
+        ):
             self.assertIn(
                 f'hl.on("{event}", keep_click_focus)', backend.RULES_BODY,
                 f"{event} must re-assert click-only focus",
             )
         self.assertRegex(
             backend.RULES_BODY,
-            r"local function keep_click_focus\(\)\s*\n\s*hl\.config\(\{[^}]*follow_mouse = 0",
+            r"local function keep_click_focus\(\)\s*\n"
+            r"(?:\s*--[^\n]*\n)*"
+            r"\s*if hl\.get_config and hl\.get_config\(\"input\.follow_mouse\"\) ~= 0 then\s*\n"
+            r"\s*hl\.config\(\{[^}]*follow_mouse = 0",
         )
 
     def test_bind_block_roundtrip(self):
