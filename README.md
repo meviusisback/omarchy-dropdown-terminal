@@ -75,7 +75,7 @@ Everything runs in your own user session: no network access, no root, and no sys
 ## Configuration
 
 - **Keybind** (`~/.config/hypr/bindings.lua`, marker-anchored block): `SUPER + U` calls the CLI by its absolute `~/.local/bin` path. Re-running `./install.sh` refreshes the block when its contents changed.
-- **Window rules** (`~/.config/hypr/dropdown-terminal.lua`): `special_fallthrough = true`, `follow_mouse = 0` and `float_switch_override_focus = 0` — the last two turn off hover-to-focus **for the whole desktop** (focus changes on click only); that is what makes dismissal click-based. It also pins the drop direction for the `specialWorkspaceIn`/`specialWorkspaceOut` animation leaves (`slidevert top` on show, `slidevert bottom` on hide) — animations are global per leaf, so **every** special workspace on that monitor (including the Omarchy scratchpad, `SUPER + S`) drops in from the top once installed. Uninstall removes the block; delete the `hl.animation` lines to get Hyprland's default motion back.
+- **Window rules** (`~/.config/hypr/dropdown-terminal.lua`): `special_fallthrough = true`, `follow_mouse = 0` and `float_switch_override_focus = 0` — the last two turn off hover-to-focus **for the whole desktop** (focus changes on click only); that is what makes dismissal click-based. The rules also re-assert both values on Hyprland's workspace/monitor focus events, because Omarchy's `workspace-modes` module caches `follow_mouse` when it loads and would otherwise write the hover-focus default back after startup. It also pins the drop direction for the `specialWorkspaceIn`/`specialWorkspaceOut` animation leaves (`slidevert top` on show, `slidevert bottom` on hide) — animations are global per leaf, so **every** special workspace on that monitor (including the Omarchy scratchpad, `SUPER + S`) drops in from the top once installed. Uninstall removes the block; delete the `hl.animation` lines to get Hyprland's default motion back.
 - **State and socket** (`$XDG_RUNTIME_DIR`): the watcher publishes visibility to `dropdown-terminal.state` (0600, atomic, only on change) for the bar widget, and the foot server listens on `foot-dropdown-terminal.sock` (systemd's `%t`).
 
 ## How it works
@@ -85,7 +85,7 @@ Everything runs in your own user session: no network access, no root, and no sys
 Verify with:
 
 ```bash
-python3 tests/test_backend.py        # 60 - config writes, keybind refresh, idempotency, unit + tool resolution
+python3 tests/test_backend.py        # 61 - config writes, keybind refresh, idempotency, unit + tool resolution
 python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
 python3 tests/test_focus_watcher.py  # 41 - event state machine, path validation, state file, socket
 ```

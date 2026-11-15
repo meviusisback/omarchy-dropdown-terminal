@@ -113,6 +113,25 @@ class BackendTest(unittest.TestCase):
                 f"{leaf} must pin its drop direction ({style})",
             )
 
+    def test_rules_body_reasserts_follow_mouse_after_omarchy_resets_it(self):
+        # Regression: Omarchy's workspace-modes.lua caches input.follow_mouse
+        # when it loads (before this file, so Omarchy's default 1) and writes
+        # it back on workspace/monitor events. Without these listeners the
+        # first event after startup turned hover-to-focus back on and moving
+        # the pointer out of the dropdown closed it. The generated rules must
+        # install handlers that put follow_mouse = 0 back.
+        self.assertIn("follow_mouse = 0", backend.RULES_BODY)
+        self.assertIn("float_switch_override_focus = 0", backend.RULES_BODY)
+        for event in ("workspace.active", "monitor.focused"):
+            self.assertIn(
+                f'hl.on("{event}", keep_click_focus)', backend.RULES_BODY,
+                f"{event} must re-assert click-only focus",
+            )
+        self.assertRegex(
+            backend.RULES_BODY,
+            r"local function keep_click_focus\(\)\s*\n\s*hl\.config\(\{[^}]*follow_mouse = 0",
+        )
+
     def test_bind_block_roundtrip(self):
         backend.atomic_write(backend.BINDINGS_LUA, "-- my binds\n")
         body = backend.bind_body()
