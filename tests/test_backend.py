@@ -122,7 +122,7 @@ class BackendTest(unittest.TestCase):
         # workspace.special_active, not workspace.active. Without all four
         # listeners hover-to-focus came back and moving the pointer out of the
         # dropdown closed it. The handler must also be guarded on the current
-        # value: a runtime hl.config schedules config.props_refreshed, so an
+        # values: a runtime hl.config schedules config.props_refreshed, so an
         # unguarded re-assert would loop.
         self.assertIn("follow_mouse = 0", backend.RULES_BODY)
         self.assertIn("float_switch_override_focus = 0", backend.RULES_BODY)
@@ -140,7 +140,10 @@ class BackendTest(unittest.TestCase):
             backend.RULES_BODY,
             r"local function keep_click_focus\(\)\s*\n"
             r"(?:\s*--[^\n]*\n)*"
-            r"\s*if hl\.get_config and hl\.get_config\(\"input\.follow_mouse\"\) ~= 0 then\s*\n"
+            r"\s*if hl\.get_config then\s*\n"
+            r"\s*local follow_ok = hl\.get_config\(\"input\.follow_mouse\"\) == 0\s*\n"
+            r"\s*local float_ok = hl\.get_config\(\"input\.float_switch_override_focus\"\) == 0\s*\n"
+            r"\s*if not \(follow_ok and float_ok\) then\s*\n"
             r"\s*hl\.config\(\{[^}]*follow_mouse = 0",
         )
 

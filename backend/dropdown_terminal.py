@@ -268,18 +268,20 @@ end
 
 -- Keep follow_mouse = 0 from being undone by Omarchy's workspace modes.
 --
--- default/hypr/workspace-modes.lua caches the input.follow_mouse it sees on
--- load (Omarchy's default 1 on a stock config) and writes that cached value
--- back from update_input() whenever a workspace's floating state changes. That
--- includes the direct o.workspace_mode() call behind SUPER + L, which runs via
--- `hyprctl eval` and emits no workspace event. The reset can therefore happen
--- at startup, after a layout cycle, or while the dropdown is already open.
--- Merely moving the pointer out then focuses the window underneath, the focus
--- watcher sees the dropdown lose focus, and the terminal closes on hover
--- instead of on click.
+-- default/hypr/workspace-modes.lua caches the input.follow_mouse it sees the
+-- first time its watch() runs (Omarchy's default 1 on a stock config) and
+-- writes that cached value back from update_input() whenever a workspace's
+-- floating state changes. That includes the direct o.workspace_mode() call
+-- behind SUPER + L, which runs via `hyprctl eval` and emits no workspace event.
+-- The reset can therefore happen at startup, after a layout cycle, or while the
+-- dropdown is already open. Merely moving the pointer out then focuses the
+-- window underneath, the focus watcher sees the dropdown lose focus, and the
+-- terminal closes on hover instead of on click.
 --
 -- Re-assert after Omarchy's own listeners: Hyprland invokes hl.on callbacks in
--- registration order, and this file is loaded after default.hypr.omarchy.
+-- registration order, and the installer appends this hook after Omarchy's
+-- config in hyprland.lua (later plugin hooks load after it, so this is a
+-- registration-order guarantee for these events, not a "loaded last" one).
 -- workspace.special_active covers showing/hiding the panel (Hyprland 0.56
 -- emits that event, not workspace.active, from setSpecialWorkspace), and
 -- config.props_refreshed is the signal a runtime hl.config produces - the only
@@ -287,9 +289,13 @@ end
 if hl and hl.on then
   local function keep_click_focus()
     -- A runtime hl.config schedules another prop refresh; write only when a
-    -- different writer actually moved the value, so this cannot loop.
-    if hl.get_config and hl.get_config("input.follow_mouse") ~= 0 then
-      hl.config({{ input = {{ follow_mouse = 0, float_switch_override_focus = 0 }} }})
+    -- different writer actually moved a value, so this cannot loop.
+    if hl.get_config then
+      local follow_ok = hl.get_config("input.follow_mouse") == 0
+      local float_ok = hl.get_config("input.float_switch_override_focus") == 0
+      if not (follow_ok and float_ok) then
+        hl.config({{ input = {{ follow_mouse = 0, float_switch_override_focus = 0 }} }})
+      end
     end
   end
   hl.on("workspace.active", keep_click_focus)
