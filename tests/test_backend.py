@@ -144,7 +144,7 @@ class BackendTest(unittest.TestCase):
             r"\s*local follow_ok = hl\.get_config\(\"input\.follow_mouse\"\) == 0\s*\n"
             r"\s*local float_ok = hl\.get_config\(\"input\.float_switch_override_focus\"\) == 0\s*\n"
             r"\s*if not \(follow_ok and float_ok\) then\s*\n"
-            r"\s*hl\.config\(\{[^}]*follow_mouse = 0",
+            r"\s*hl\.config\(\{[^}]*follow_mouse = 0[^}]*float_switch_override_focus = 0",
         )
 
     def test_bind_block_roundtrip(self):
