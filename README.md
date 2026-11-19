@@ -23,7 +23,7 @@ A scratch terminal should be one keypress away, on every workspace, with nothing
 - **Click outside to dismiss** — a focus watcher hides the dropdown the moment it loses focus. It is **event-driven**: it subscribes to Hyprland's event socket (`activewindow` / `activespecial`), so it costs nothing while you work instead of polling the compositor (if the socket is missing or stale it falls back to a 2 s poll). Dismissal is click-based: the plugin sets `input:follow_mouse = 0` and `float_switch_override_focus = 0` so moving the mouse never steals focus, re-asserts `follow_mouse = 0` (repairing the float setting with it) on workspace/monitor/special-workspace events and runtime config refreshes, and `input:special_fallthrough` lets your click reach the window underneath.
 - **Bar widget** — shows terminal state at a glance (accent = shown). Left click toggles, right click opens a small menu (show/hide, kill server). The state is event-driven too: the watcher publishes it to a small file the widget watches, so there is no periodic status poll.
 - **IPC control** — `omarchy-shell shell toggle meviusisback.dropdown-terminal`, plus `open`, `close`, `kill` and `status` methods.
-- **Clean install/uninstall** — one marker-anchored block in your Hyprland config, one line, one systemd unit. Uninstall removes the keybind block, the window rules, the hook line and the systemd unit, and restores any config file it had backed up; the single-instance lock file and the runtime state file are left in place on purpose, because unlinking a lock another process may still hold would let two watchers run at once.
+- **Clean install/uninstall** — one marker-anchored block in your Hyprland config, one line, one systemd unit. Uninstall removes the keybind block, the window rules, the hook line and the systemd unit, and restores the most recently displaced config file; earlier copies stay next to it as numbered `.bak.N` files. The single-instance lock file and the runtime state file are left in place on purpose, because unlinking a lock another process may still hold would let two watchers run at once.
 
 ## Install
 
@@ -36,7 +36,7 @@ cd ~/.config/omarchy/plugins/meviusisback.dropdown-terminal
 
 `omarchy plugin add` only puts the files on disk; `./install.sh` is the part a plugin cannot do for itself (writing your Hyprland config and enabling a user unit). It:
 
-1. Installs a parameterized systemd user unit `foot-server@.service` (backing up any pre-existing file of that name) and enables the `dropdown-terminal` instance — a persistent `foot` server with a dedicated app-id (`org.omarchy.dropdown-terminal`) and its own socket, so your normal foot setup stays untouched.
+1. Installs its own systemd user unit `foot-dropdown-terminal.service` (backing up any foreign pre-existing file of that name; a different file appearing later is preserved as a numbered `.bak.N` before the backup is refreshed) — a persistent `foot` server with a dedicated app-id (`org.omarchy.dropdown-terminal`) and its own socket, so your normal foot setup stays untouched. Upgrading from 0.1.x removes the generic `foot-server@.service` template it used to write, but only when that file carries the plugin's own unit header, and restores any file the old install displaced.
 2. Writes `dropdown-terminal.lua` (window rules) under the Hyprland config dir (`$XDG_CONFIG_HOME/hypr`, or `~/.config/hypr` when unset) and hooks it into `~/.config/hypr/hyprland.lua` (same pattern as the Omarchy workspace-layout plugin).
 3. Writes a marker-anchored keybind block to `~/.config/hypr/bindings.lua`: `SUPER + U` → `~/.local/bin/omarchy-dropdown-terminal toggle`. Re-running `install.sh` is safe: it refreshes the block when its contents changed and reports `updated` when it did.
 4. Reloads Hyprland. Press **SUPER + U**.
@@ -66,11 +66,11 @@ uninstall remove everything the plugin installed
 
 - **Omarchy** with its Hyprland build — toggling uses the Lua dispatch engine (`hl.dsp.workspace.toggle_special`), not the legacy `dispatch togglespecialworkspace` syntax.
 - **foot** — provides `foot` and `footclient` (Arch: `pacman -S foot`). The persistent session is a foot *server*; your own foot config and windows stay untouched, because the dropdown uses its own app-id and socket.
-- **systemd user instance** — the session lives in the user unit `foot-server@dropdown-terminal.service`.
+- **systemd user instance** — the session lives in the user unit `foot-dropdown-terminal.service`.
 - **python3** and **bash** at their absolute system paths (`/usr/bin/python3`, `/usr/bin/bash`) — standard library only; the backend, the watcher and the CLI use no third-party packages. Every tool the plugin runs is resolved to a validated absolute path, never through `PATH`, so a layout that keeps them elsewhere is not supported.
 - **omarchy-shell** — for the bar widget and the `omarchy-shell shell toggle meviusisback.dropdown-terminal` IPC method.
 
-Everything runs in your own user session: no network access, no root, and no systemd service beyond the user unit `foot-server@dropdown-terminal.service`. The bar widget additionally starts one small `focus_watcher` helper. It publishes the dropdown's visibility to the bar and hides the dropdown when focus leaves it, by calling the CLI's own `close` path; the widget stops it when it is destroyed, so a shell that dies without running its destructor can leave it holding the single-instance lock until you kill it.
+Everything runs in your own user session: no network access, no root, and no systemd service beyond the user unit `foot-dropdown-terminal.service`. The bar widget additionally starts one small `focus_watcher` helper. It publishes the dropdown's visibility to the bar and hides the dropdown when focus leaves it, by calling the CLI's own `close` path; the widget stops it when it is destroyed, so a shell that dies without running its destructor can leave it holding the single-instance lock until you kill it.
 
 ## Configuration
 
@@ -85,8 +85,8 @@ Everything runs in your own user session: no network access, no root, and no sys
 Verify with:
 
 ```bash
-python3 tests/test_backend.py        # 61 - config writes, keybind refresh, idempotency, unit + tool resolution
-python3 tests/test_proc.py           # 20 - trusted-path resolver, bounded output, timeouts
+python3 tests/test_backend.py        # 74 - config writes, keybind refresh, idempotency, unit + tool resolution
+python3 tests/test_proc.py           # 21 - trusted-path resolver, bounded output, timeouts
 python3 tests/test_focus_watcher.py  # 41 - event state machine, path validation, state file, socket
 ```
 
@@ -99,7 +99,7 @@ Host-static and hermetic: no compositor needed, `HOME` is repointed and systemct
 omarchy plugin remove meviusisback.dropdown-terminal # plugin files + bar entry
 ```
 
-Stops and disables the server (ordered to defeat the systemd respawn race), then removes the keybind block, the hook lines, the rules file and the unit.
+Stops and disables the server (ordered to defeat the systemd respawn race), then removes the keybind block, the hook lines, the rules file and the plugin-owned unit. The most recently displaced file is restored; earlier copies remain as numbered backups. The old 0.1.x `foot-server@.service` template is removed only when it carries the plugin's own unit header, so a user-owned template is never touched.
 
 ## License
 

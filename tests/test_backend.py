@@ -12,6 +12,8 @@ import json
 import os
 import pwd
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -50,9 +52,21 @@ def terminal_run_bash(script):
 
 class BackendTest(unittest.TestCase):
     def setUp(self):
-        for p in (backend.HYPRLAND_LUA, backend.BINDINGS_LUA, backend.RULES_PATH,
-                  backend.UNIT_DST_PATH, backend.UNIT_DST_PATH + ".pre-dropdown-terminal.bak"):
-            if os.path.exists(p):
+        cleanup = [
+            backend.HYPRLAND_LUA,
+            backend.BINDINGS_LUA,
+            backend.RULES_PATH,
+            backend.UNIT_DST_PATH,
+            backend.LEGACY_UNIT_DST_PATH,
+        ]
+        for base in (backend.UNIT_DST_PATH, backend.LEGACY_UNIT_DST_PATH,
+                     backend.RULES_PATH):
+            cleanup.append(base + backend.BACKUP_SUFFIX)
+            cleanup.extend(
+                f"{base}{backend.BACKUP_SUFFIX}.{n}" for n in range(1, 5)
+            )
+        for p in cleanup:
+            if os.path.lexists(p):
                 os.unlink(p)
 
         # Hermetic substitution: tools "resolve" without touching the filesystem's
@@ -247,7 +261,225 @@ class BackendTest(unittest.TestCase):
     def test_unit_install_idempotent_no_second_backup(self):
         backend.install_unit()
         backend.install_unit()
-        self.assertFalse(os.path.exists(backend.UNIT_DST_PATH + ".pre-dropdown-terminal.bak"))
+        self.assertFalse(os.path.exists(backend.UNIT_DST_PATH + backend.BACKUP_SUFFIX))
+
+    def test_install_never_writes_the_shared_foot_server_template(self):
+        # 0.1.x wrote ~/.config/systemd/user/foot-server@.service, which shadows
+        # EVERY foot-server@<instance> for this user. A foreign file at that path
+        # must survive install byte-for-byte, mode included, and the plugin's own
+        # unit must live under its own name.
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        foreign = "[Unit]\nDescription=someone else's foot server\n"
+        backend.atomic_write(backend.LEGACY_UNIT_DST_PATH, foreign)
+        os.chmod(backend.LEGACY_UNIT_DST_PATH, 0o600)
+
+        results = backend.install(quiet=True)
+
+        self.assertEqual(results["legacy_unit"], "kept: not ours")
+        self.assertEqual(backend.read_text(backend.LEGACY_UNIT_DST_PATH), foreign)
+        self.assertEqual(
+            os.stat(backend.LEGACY_UNIT_DST_PATH).st_mode & 0o777, 0o600
+        )
+        self.assertFalse(
+            os.path.exists(backend.LEGACY_UNIT_DST_PATH + backend.BACKUP_SUFFIX)
+        )
+        self.assertNotEqual(backend.UNIT_DST_PATH, backend.LEGACY_UNIT_DST_PATH)
+        self.assertTrue(backend.read_text(backend.UNIT_DST_PATH).startswith(backend.UNIT_BEGIN))
+
+    def test_install_migrates_the_legacy_marker_owned_unit(self):
+        # Upgrading from 0.1.x: drop the old template, stop its instance (it holds
+        # the socket the new unit needs) and restore whatever the old install
+        # displaced, with the original's mode.
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        original = "[Unit]\nDescription=the user's own template\n"
+        backend.atomic_write(backend.LEGACY_UNIT_DST_PATH + backend.BACKUP_SUFFIX, original)
+        os.chmod(backend.LEGACY_UNIT_DST_PATH + backend.BACKUP_SUFFIX, 0o600)
+        backend.atomic_write(
+            backend.LEGACY_UNIT_DST_PATH, backend.unit_body("/usr/bin/foot")
+        )
+
+        results = backend.install(quiet=True)
+
+        self.assertEqual(results["legacy_unit"], "removed; backup restored")
+        self.assertEqual(backend.read_text(backend.LEGACY_UNIT_DST_PATH), original)
+        self.assertEqual(
+            os.stat(backend.LEGACY_UNIT_DST_PATH).st_mode & 0o777, 0o600
+        )
+        self.assertFalse(
+            os.path.exists(backend.LEGACY_UNIT_DST_PATH + backend.BACKUP_SUFFIX)
+        )
+        calls = [" ".join(argv) for argv in backend.CALLS]
+        self.assertTrue(
+            any("disable" in call and backend.LEGACY_UNIT_REF in call for call in calls),
+            "the old foot-server@ instance was not stopped",
+        )
+        self.assertTrue(
+            any("enable" in call and backend.UNIT_REF in call for call in calls),
+            "the plugin-owned unit was not enabled",
+        )
+
+    def test_uninstall_restores_the_displaced_unit_and_mode(self):
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        original = "[Unit]\nDescription=my own foot server\n"
+        backend.atomic_write(backend.UNIT_DST_PATH, original)
+        os.chmod(backend.UNIT_DST_PATH, 0o600)
+        backend.install(quiet=True)
+
+        results = backend.uninstall()
+
+        self.assertEqual(results["unit_file"], "removed; backup restored")
+        self.assertEqual(backend.read_text(backend.UNIT_DST_PATH), original)
+        self.assertEqual(os.stat(backend.UNIT_DST_PATH).st_mode & 0o777, 0o600)
+        self.assertFalse(os.path.exists(backend.UNIT_DST_PATH + backend.BACKUP_SUFFIX))
+
+    def test_uninstall_leaves_a_foreign_plugin_unit_in_place(self):
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        foreign = "[Unit]\nDescription=not the plugin's unit\n"
+        backend.atomic_write(backend.UNIT_DST_PATH, foreign)
+
+        results = backend.uninstall()
+
+        self.assertEqual(results["unit_file"], "skipped: not ours, leaving in place")
+        self.assertEqual(backend.read_text(backend.UNIT_DST_PATH), foreign)
+
+    def test_uninstall_removes_the_legacy_template_only_when_ours(self):
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        original = "[Unit]\nDescription=the user's own template\n"
+        backend.atomic_write(backend.LEGACY_UNIT_DST_PATH + backend.BACKUP_SUFFIX, original)
+        os.chmod(backend.LEGACY_UNIT_DST_PATH + backend.BACKUP_SUFFIX, 0o600)
+        backend.atomic_write(
+            backend.LEGACY_UNIT_DST_PATH, backend.unit_body("/usr/bin/foot")
+        )
+
+        results = backend.uninstall()
+
+        self.assertEqual(results["legacy_unit"], "removed; backup restored")
+        self.assertEqual(backend.read_text(backend.LEGACY_UNIT_DST_PATH), original)
+        self.assertEqual(
+            os.stat(backend.LEGACY_UNIT_DST_PATH).st_mode & 0o777, 0o600
+        )
+
+    def test_uninstall_leaves_a_foreign_legacy_template_in_place(self):
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        foreign = "[Unit]\nDescription=someone else's template\n"
+        backend.atomic_write(backend.LEGACY_UNIT_DST_PATH, foreign)
+
+        results = backend.uninstall()
+
+        self.assertEqual(results["legacy_unit"], "kept: not ours")
+        self.assertEqual(backend.read_text(backend.LEGACY_UNIT_DST_PATH), foreign)
+
+    def test_backups_preserve_the_source_mode(self):
+        # A private 0600 unit/rules file must not become a 0644 copy that other
+        # local users can read through a traversable parent directory.
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        os.makedirs(backend.HYPRLAND_DIR, exist_ok=True)
+        backend.atomic_write(backend.UNIT_DST_PATH, "# foreign unit\n")
+        os.chmod(backend.UNIT_DST_PATH, 0o600)
+        backend.atomic_write(backend.RULES_PATH, "-- foreign rules\n")
+        os.chmod(backend.RULES_PATH, 0o640)
+
+        backend.install(quiet=True)
+
+        self.assertEqual(
+            os.stat(backend.UNIT_DST_PATH + backend.BACKUP_SUFFIX).st_mode & 0o777, 0o600
+        )
+        self.assertEqual(
+            os.stat(backend.RULES_PATH + backend.BACKUP_SUFFIX).st_mode & 0o777, 0o640
+        )
+
+    def test_marker_mention_is_not_unit_ownership(self):
+        # The bare plugin id in a comment must not make a user's unit ours: it must
+        # survive install (legacy name), be backed up before overwrite (current
+        # name), and survive uninstall.
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        mention = (
+            f"# {backend.MARKER} is the plugin this is based on\n"
+            "[Service]\nExecStart=/bin/true\n"
+        )
+        backend.atomic_write(backend.LEGACY_UNIT_DST_PATH, mention)
+
+        results = backend.install(quiet=True)
+
+        self.assertEqual(results["legacy_unit"], "kept: not ours")
+        self.assertEqual(backend.read_text(backend.LEGACY_UNIT_DST_PATH), mention)
+        self.assertFalse(
+            os.path.exists(backend.LEGACY_UNIT_DST_PATH + backend.BACKUP_SUFFIX)
+        )
+
+        backend.atomic_write(backend.UNIT_DST_PATH, mention)
+        backend.install_unit("/usr/bin/foot")
+        self.assertEqual(
+            backend.read_text(backend.UNIT_DST_PATH + backend.BACKUP_SUFFIX), mention
+        )
+
+        backend.atomic_write(backend.UNIT_DST_PATH, mention)
+        results = backend.uninstall()
+        self.assertEqual(results["unit_file"], "skipped: not ours, leaving in place")
+        self.assertEqual(backend.read_text(backend.UNIT_DST_PATH), mention)
+
+    def test_second_foreign_file_is_backed_up_not_destroyed(self):
+        # A later hand-written file at the plugin path must not be silently lost
+        # because a backup from the first install already exists.
+        os.makedirs(backend.SYSTEMD_USER_DIR, exist_ok=True)
+        first, second = "# first\n", "# second\n"
+        backend.atomic_write(backend.UNIT_DST_PATH, first)
+        os.chmod(backend.UNIT_DST_PATH, 0o600)
+        backend.install(quiet=True)
+
+        # Re-seeing the same foreign content must not add a numbered copy.
+        backend.atomic_write(backend.UNIT_DST_PATH, first)
+        backend.install(quiet=True)
+        self.assertFalse(
+            os.path.exists(backend.UNIT_DST_PATH + backend.BACKUP_SUFFIX + ".1")
+        )
+
+        backend.atomic_write(backend.UNIT_DST_PATH, second)
+        os.chmod(backend.UNIT_DST_PATH, 0o600)
+        backend.install(quiet=True)
+
+        backup = backend.UNIT_DST_PATH + backend.BACKUP_SUFFIX
+        older = backup + ".1"
+        self.assertEqual(backend.read_text(backup), second)
+        self.assertEqual(backend.read_text(older), first)
+        self.assertEqual(os.stat(backup).st_mode & 0o777, 0o600)
+
+        results = backend.uninstall()
+
+        # The most recently displaced file is the one restored; the earlier copy is
+        # still preserved alongside it.
+        self.assertEqual(results["unit_file"], "removed; backup restored")
+        self.assertEqual(backend.read_text(backend.UNIT_DST_PATH), second)
+        self.assertFalse(os.path.exists(backup))
+        self.assertEqual(backend.read_text(older), first)
+
+    def test_hook_removal_matches_only_the_installed_lines(self):
+        user_comment = f"-- {backend.MARKER} is the plugin I read\n"
+        user_hook = 'dofile("/home/me/.config/hypr/dropdown-terminal.lua") -- mine\n'
+        backend.atomic_write(
+            backend.HYPRLAND_LUA,
+            user_comment + user_hook + backend.HOOK_LINE + "other = 1\n",
+        )
+        self.assertTrue(backend._remove_hook_line())
+        content = backend.read_text(backend.HYPRLAND_LUA)
+        self.assertIn(user_comment, content)
+        self.assertIn(user_hook, content)
+        self.assertIn("other = 1", content)
+        self.assertNotIn(backend.HOOK_COMMENT, content)
+        self.assertNotIn(backend.HOOK_DO, content)
+
+        # A half-edited hook is not the pair we wrote: leave it for a human.
+        partial = backend.HOOK_COMMENT + "\n" + backend.HOOK_DO + " -- edited\n"
+        backend.atomic_write(backend.HYPRLAND_LUA, partial)
+        self.assertFalse(backend._remove_hook_line())
+        self.assertEqual(backend.read_text(backend.HYPRLAND_LUA), partial)
+
+    def test_hook_line_present_matches_the_whole_comment(self):
+        backend.atomic_write(
+            backend.HYPRLAND_LUA,
+            f"-- {backend.MARKER} is mentioned here, but this is not the hook\n",
+        )
+        self.assertFalse(backend.line_present(backend.HYPRLAND_LUA, backend.HOOK_COMMENT))
 
     def test_hook_line_install_and_removal(self):
         backend.atomic_write(backend.HYPRLAND_LUA, 'require("hypr.bindings")\n')
@@ -309,7 +541,10 @@ class BackendTest(unittest.TestCase):
         backend.install(quiet=True)
         with open(backend.UNIT_DST_PATH) as handle:
             unit = handle.read()
-        self.assertIn("ExecStart=/opt/verified/foot --server=%t/foot-%i.sock", unit)
+        self.assertIn(
+            "ExecStart=/opt/verified/foot --server=%t/foot-dropdown-terminal.sock", unit
+        )
+        self.assertNotIn("%i", unit)
         self.assertNotIn("ExecStart=/usr/bin/foot", unit)
 
     def test_no_call_site_passes_a_bare_tool_name(self):
@@ -368,6 +603,20 @@ class BackendTest(unittest.TestCase):
         with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
             cli = handle.read()
         self.assertIn('exec "$PYTHON" -I -E -S', cli)
+
+    def test_panel_status_merge_notifies_bindings_and_only_actions_clear_busy(self):
+        # Member writes on a property-var object emit no change signal, so the
+        # status merge must reassign ddState; and statusProc must not clear the
+        # action mutex it never set.
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "Panel.qml")) as handle:
+            panel = handle.read()
+        self.assertIn("const next = Object.assign({}, root.ddState)", panel)
+        self.assertIn("root.ddState = next", panel)
+        self.assertNotIn("root.ddState.visible =", panel)
+        self.assertNotIn("root.ddState[key] =", panel)
+        self.assertEqual(panel.count("root.busy = false"), 1)
+        self.assertIn("decodeURIComponent(Qt.resolvedUrl", panel)
 
     def test_runtime_dir_rules_live_in_one_place(self):
         # The CLI and the widget must not re-implement the runtime-dir rules: they
@@ -451,7 +700,8 @@ class BackendTest(unittest.TestCase):
         self.assertIn('uninstall)   wanted="hyprctl python3 systemctl rm"', cli)
         # and the variables those lists resolve are the ones actually used
         self.assertIn('"$SLEEP" 0.2', cli)
-        self.assertIn('"$RM" -f "$home_dir/.local/bin/omarchy-dropdown-terminal"', cli)
+        self.assertIn('if [ -L "$local_bin" ]; then', cli)
+        self.assertIn('"$RM" -f "$local_bin"', cli)
         self.assertIn('"$LN" -sfn', cli)
         self.assertIn('home_dir="$(validate_home)"', cli)
 
@@ -730,10 +980,9 @@ class BackendTest(unittest.TestCase):
         sock = backend.socket_path(TEST_UIDS)
         self.assertTrue(sock.endswith("/foot-dropdown-terminal.sock"), sock)
         self.assertEqual(os.path.dirname(sock), f"/run/user/{os.getuid()}")
-        unit_bind = "--server=%t/foot-%i.sock".replace("%i", backend.UNIT_INSTANCE)
-        self.assertEqual(os.path.basename(sock), os.path.basename(unit_bind))
-        self.assertIn("--server=%t/foot-%i.sock", backend.unit_body("/usr/bin/foot"))
-        self.assertEqual(backend.FOOT_SOCKET_NAME, f"foot-{backend.UNIT_INSTANCE}.sock")
+        unit_body = backend.unit_body("/usr/bin/foot")
+        self.assertIn(f"--server=%t/{backend.FOOT_SOCKET_NAME}", unit_body)
+        self.assertEqual(os.path.basename(sock), backend.FOOT_SOCKET_NAME)
 
     def test_state_path_no_longer_diverges_from_the_watcher(self):
         import focus_watcher
@@ -800,6 +1049,55 @@ class BackendTest(unittest.TestCase):
         backend.install_unit("/usr/bin/foot")
         self.assertTrue(os.path.isfile(backend.UNIT_DST_PATH + ".pre-dropdown-terminal.bak"))
         self.assertFalse(os.path.lexists(target), "the symlink target was written through")
+
+    def test_uninstall_leaves_a_non_symlink_cli_in_place(self):
+        # install refuses a non-symlink at the local-bin path; uninstall must not
+        # delete one either (it may be the user's own wrapper).
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        with open(os.path.join(repo, "bin", "omarchy-dropdown-terminal")) as handle:
+            source = handle.read()
+        start = source.index("do_uninstall() {")
+        end = source.index("\n}\n", start) + 3
+        func = source[start:end]
+
+        home = tempfile.mkdtemp(prefix="ddt-uninst-")
+        self.addCleanup(shutil.rmtree, home, True)
+        local_bin = os.path.join(home, ".local", "bin")
+        os.makedirs(local_bin)
+        target = os.path.join(local_bin, "omarchy-dropdown-terminal")
+        with open(target, "w") as handle:
+            handle.write("#!/bin/sh\necho mine\n")
+
+        def run(tail):
+            script = (
+                "set -u\n"
+                f"HOME={shlex.quote(home)}\n"
+                "RM=/usr/bin/rm\n"
+                "SYSTEMCTL=/bin/true\n"
+                "HYPRCTL=/bin/true\n"
+                'msg() { printf "msg:%s\\n" "$*"; }\n'
+                "run_backend() { :; }\n"
+                'validate_home() { printf "%s" "$HOME"; }\n'
+                + func + "\n"
+                "do_uninstall\n"
+                + tail
+            )
+            return terminal_run_bash(script)
+
+        out = run(
+            'if [ -f "$HOME/.local/bin/omarchy-dropdown-terminal" ]; then '
+            "echo REGULAR_KEPT; fi\n"
+        )
+        self.assertIn("Left ", out)
+        self.assertIn("REGULAR_KEPT", out)
+
+        os.unlink(target)
+        os.symlink("/bin/true", target)
+        out = run(
+            'if [ -L "$HOME/.local/bin/omarchy-dropdown-terminal" ]; then '
+            "echo LINK_LEFT; else echo LINK_REMOVED; fi\n"
+        )
+        self.assertIn("LINK_REMOVED", out)
 
     def test_ensure_server_waits_for_the_socket_on_the_cold_path(self):
         # Two review rounds missed this: the socket wait must run on the COLD path
