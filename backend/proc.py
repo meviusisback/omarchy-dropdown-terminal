@@ -204,24 +204,29 @@ def build_env(base=None):
 
 
 def _kill_group(proc):
-    """SIGTERM then SIGKILL the child's process group, then reap it."""
+    """SIGTERM then SIGKILL the child's process group, then reap it.
+
+    The group leader is NOT reaped between the two signals: a leader that exits on
+    SIGTERM says nothing about the other members (a SIGTERM-ignoring helper would
+    survive a wait()-based early return), and keeping the leader as an unreaped
+    zombie also reserves its pid, so killpg() cannot hit a recycled group.
+    """
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
-        pgid = None
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+        # start_new_session=True made the child its own group leader; if it has
+        # already exited but not been reaped, that group id is still ours to signal.
+        pgid = proc.pid
+
+    def signal_group(sig):
         try:
-            if pgid is not None:
-                os.killpg(pgid, sig)
-            else:
-                proc.send_signal(sig)
+            os.killpg(pgid, sig)
         except OSError:
             pass
-        try:
-            proc.wait(timeout=0.4)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+
+    signal_group(signal.SIGTERM)
+    time.sleep(0.4)          # grace period, without reaping the leader
+    signal_group(signal.SIGKILL)
     try:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:  # pragma: no cover - unkillable child

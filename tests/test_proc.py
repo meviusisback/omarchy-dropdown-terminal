@@ -10,6 +10,7 @@ defaults (root-owned, the fixed /usr/bin-style directories) are asserted too.
 """
 
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -145,6 +146,51 @@ class RunTest(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertLess(elapsed, 10)
         self.assertNotEqual(result.returncode, 0)
+
+    def test_timeout_kills_sigterm_ignoring_group_members(self):
+        # The leader exits on SIGTERM; a member that ignores it must still be
+        # killed by the unconditional SIGKILL, and must not be reaped early.
+        script = (
+            "import os, signal, sys, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    with open(sys.argv[1], 'w') as handle:\n"
+            "        handle.write(str(os.getpid()))\n"
+            "    time.sleep(60)\n"
+            "    os._exit(0)\n"
+            "time.sleep(60)\n"
+        )
+
+        def running(pid):
+            try:
+                with open(f"/proc/{pid}/stat") as handle:
+                    state = handle.read().split()[2]
+                return state != "Z"
+            except (OSError, IndexError):
+                return False
+
+        with tempfile.TemporaryDirectory(prefix="ddt-group-") as directory:
+            helper = os.path.join(directory, "group.py")
+            pidfile = os.path.join(directory, "child.pid")
+            with open(helper, "w") as handle:
+                handle.write(script)
+
+            result = proc.run([PY, helper, pidfile], timeout=1, limit=4096)
+            self.assertTrue(result.timed_out)
+
+            with open(pidfile) as handle:
+                pid = int(handle.read())
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and running(pid):
+                time.sleep(0.05)
+            survivor = running(pid)
+            if survivor:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            self.assertFalse(survivor, "a SIGTERM-ignoring group member survived")
 
     def test_child_gets_a_minimal_environment(self):
         os.environ["DDT_SECRET_MARKER"] = "leak-me"

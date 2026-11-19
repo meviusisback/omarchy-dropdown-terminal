@@ -351,13 +351,16 @@ o.window("{DROPDOWN_APP_ID}", {{
 {RULES_END}
 """
 
-HOOK_LINE = (
-    f"-- Added by the {MARKER} plugin: installs the drop-down terminal window rules.\n"
+HOOK_COMMENT = (
+    f"-- Added by the {MARKER} plugin: installs the drop-down terminal window rules."
+)
+HOOK_DO = (
     'do local x = os.getenv("XDG_CONFIG_HOME"); '
     'if not x or x == "" or x:sub(1, 1) ~= "/" then x = os.getenv("HOME") .. "/.config" end; '
     'local path = x .. "/hypr/dropdown-terminal.lua"; local file = io.open(path, "r"); '
-    "if file then file:close(); dofile(path) end end\n"
+    "if file then file:close(); dofile(path) end end"
 )
+HOOK_LINE = HOOK_COMMENT + "\n" + HOOK_DO + "\n"
 
 BIND_BEGIN = f"-- BEGIN {MARKER}"
 BIND_END = f"-- END {MARKER}"
@@ -551,8 +554,12 @@ def _backup_existing(path, content=None):
     rules file must not become a 0644 backup readable by every local user. When the
     source mode cannot be read, 0600 is the safe fallback (never wider than the
     original). A symlink planted at the backup path is removed first, so the copy is
-    written at the backup path itself and never through someone else's link; an
-    existing regular backup is the first backup and is kept as-is.
+    written at the backup path itself and never through someone else's link.
+
+    If a backup already exists, it is kept as-is only when it holds the same
+    content; a different file is preserved as a numbered `.bak.N` and the current
+    source becomes `.bak`, which is the copy uninstall restores. Nothing that was
+    at the live path is overwritten without first being copied somewhere.
     """
     if content is None:
         content = read_text(path)
@@ -560,9 +567,24 @@ def _backup_existing(path, content=None):
         return None
     backup = path + BACKUP_SUFFIX
     if os.path.lexists(backup):
-        if not os.path.islink(backup):
-            return backup
-        os.unlink(backup)
+        if os.path.islink(backup):
+            os.unlink(backup)
+        else:
+            previous = read_text(backup)
+            if previous == content:
+                return backup
+            if previous is not None:
+                number = 1
+                while os.path.lexists(f"{backup}.{number}"):
+                    number += 1
+                atomic_write(
+                    f"{backup}.{number}", previous, mode=_file_mode(backup)
+                )
+            # The live source (not the older backup) becomes .bak, so uninstall
+            # restores the file that was displaced most recently. Remove the old
+            # copy first: atomic_write would otherwise keep ITS mode, widening a
+            # private source back to the older backup's permissions.
+            os.unlink(backup)
     atomic_write(backup, content, mode=_file_mode(path))
     print(f"backed up existing {path} -> {backup}")
     return backup
@@ -599,7 +621,7 @@ def _remove_unit_file(path, key, results):
         else:
             results[key] = "absent"
         return
-    if MARKER not in text:
+    if UNIT_BEGIN not in text:
         results[key] = "skipped: not ours, leaving in place"
         return
     os.unlink(path)
@@ -632,7 +654,7 @@ def _remove_legacy_unit(results):
         if _restore_backup(LEGACY_UNIT_DST_PATH):
             results["legacy_unit"] = "backup restored"
         return
-    if MARKER not in text:
+    if UNIT_BEGIN not in text:
         results["legacy_unit"] = "kept: not ours"
         return
     _stop_unit(LEGACY_UNIT_REF)
@@ -750,7 +772,7 @@ def remove_block(path, begin, end):
 
 def line_present(path, needle):
     content = read_text(path) or ""
-    return any(needle in ln for ln in content.splitlines())
+    return any(ln.rstrip("\r\n") == needle for ln in content.splitlines())
 
 
 # -------------------------------------------------------------------- install
@@ -777,7 +799,7 @@ def install_unit(foot=None):
         raise SystemExit("cannot install the foot server unit: no trusted foot binary")
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
     existing = read_text(UNIT_DST_PATH)
-    if existing is not None and MARKER not in existing:
+    if existing is not None and UNIT_BEGIN not in existing:
         # atomic_write (mkstemp + replace) rather than open(..., "wb"): a plantable
         # symlink at the backup path must be replaced, not followed to a file of
         # someone else's choosing. read_text already bounded and validated the source.
@@ -841,7 +863,7 @@ def install(quiet=False):
 
     # 2. Hook line in hyprland.lua (keys off the full hook line).
     hook_anchor = f'"/hypr/dropdown-terminal.lua"'
-    if not line_present(HYPRLAND_LUA, f"-- Added by the {MARKER} plugin"):
+    if not line_present(HYPRLAND_LUA, HOOK_COMMENT):
         with _locked(LOCK_PATH) as _:
             content = read_text(HYPRLAND_LUA) or ""
             if hook_anchor not in content:
@@ -963,15 +985,31 @@ def uninstall():
 
 
 def _remove_hook_line():
-    """Remove the two hook lines (comment + dofile) from hyprland.lua."""
+    """Remove the two exact hook lines install appended from hyprland.lua.
+
+    Matching is line-exact on purpose: a user comment that mentions the plugin or
+    the rules-file path is their own content, not this hook, and must survive.
+    """
     with _locked(LOCK_PATH) as _:
         content = read_text(HYPRLAND_LUA)
-        if content is None or MARKER not in content:
+        if content is None:
             return False
-        kept = [
-            ln for ln in content.splitlines(keepends=True)
-            if MARKER not in ln and '/hypr/dropdown-terminal.lua' not in ln
-        ]
+        lines = content.splitlines(keepends=True)
+        kept, removed, index = [], False, 0
+        while index < len(lines):
+            pair = lines[index:index + 2]
+            if (
+                len(pair) == 2
+                and pair[0].rstrip("\r\n") == HOOK_COMMENT
+                and pair[1].rstrip("\r\n") == HOOK_DO
+            ):
+                removed = True
+                index += 2
+                continue
+            kept.append(lines[index])
+            index += 1
+        if not removed:
+            return False
         atomic_write(HYPRLAND_LUA, "".join(kept))
         return True
 

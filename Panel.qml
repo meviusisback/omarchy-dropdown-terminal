@@ -84,8 +84,10 @@ Panel {
   }
 
   function scriptPath() {
-    // bin/ is a sibling of Panel.qml inside the plugin folder.
-    return Qt.resolvedUrl("bin/omarchy-dropdown-terminal").toString().replace(/^file:\/\//, "")
+    // bin/ is a sibling of Panel.qml inside the plugin folder. resolvedUrl
+    // percent-encodes, so decode before handing the path to env/exec.
+    return decodeURIComponent(Qt.resolvedUrl("bin/omarchy-dropdown-terminal").toString())
+      .replace(/^file:\/\//, "")
   }
 
   // Every automatic process is started with a CLEARED environment: /usr/bin/env -i
@@ -139,13 +141,16 @@ Panel {
           // Merge known keys with type checks, like readState below: a
           // compromised CLI output must not inject arbitrary keys/types.
           if (parsed && typeof parsed === "object") {
-            if (typeof parsed.visible === "boolean") root.ddState.visible = parsed.visible
+            const next = Object.assign({}, root.ddState)
+            if (typeof parsed.visible === "boolean") next.visible = parsed.visible
             for (const key of ["server", "window", "workspace", "keybind"]) {
-              if (typeof parsed[key] === "string" && parsed[key].length <= 256) root.ddState[key] = parsed[key]
+              if (typeof parsed[key] === "string" && parsed[key].length <= 256) next[key] = parsed[key]
             }
+            // Reassign: member writes on a property-var object emit no change
+            // signal, so the bar bindings would never see the status result.
+            root.ddState = next
           }
         } catch (e) { /* keep previous state on malformed output */ }
-        root.busy = false
       }
     }
   }

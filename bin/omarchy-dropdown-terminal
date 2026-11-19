@@ -701,11 +701,16 @@ do_install() {
 }
 
 do_uninstall() {
-  local home_dir
+  local home_dir local_bin
   home_dir="$(validate_home)"
+  local_bin="$home_dir/.local/bin/omarchy-dropdown-terminal"
   run_backend uninstall
   "$SYSTEMCTL" --user daemon-reload
-  "$RM" -f "$home_dir/.local/bin/omarchy-dropdown-terminal"
+  if [ -L "$local_bin" ]; then
+    "$RM" -f "$local_bin"
+  else
+    msg "Left $local_bin in place (not a symlink installed by this plugin)."
+  fi
   "$HYPRCTL" reload
   msg "Uninstalled (keybind, rules, unit, server all removed)."
 }
