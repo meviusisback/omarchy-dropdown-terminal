@@ -19,7 +19,7 @@ set -euo pipefail
 
 PLUGIN_ID="meviusisback.dropdown-terminal"
 APP_ID="org.omarchy.dropdown-terminal"
-UNIT="foot-server@dropdown-terminal.service"
+UNIT="foot-dropdown-terminal.service"
 
 # Panel geometry, mirroring the `move` rule in the backend's RULES_BODY - the
 # two copies must stay in step (tests/test_backend.py fails if they drift).
@@ -279,7 +279,7 @@ parse_snapshot() {
 
 # The foot client socket path. Both the directory rules AND the socket filename come
 # from the backend (focus_watcher.runtime_dir + FOOT_SOCKET_NAME, the name the unit
-# binds as %t/foot-%i.sock), so the CLI, the watcher and the widget cannot disagree.
+# binds as %t/foot-dropdown-terminal.sock), so the CLI, the watcher and the widget cannot disagree.
 server_socket() {
   run_backend socket-path || die "no safe runtime directory for the foot socket"
 }

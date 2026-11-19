@@ -6,7 +6,7 @@ Installs/uninstalls:
   - ~/.config/hypr/dropdown-terminal.lua       (window rules for the dropdown)
   - hook line in ~/.config/hypr/hyprland.lua   (dofile wrapper, workspace-layout pattern)
   - o.bind line in ~/.config/hypr/bindings.lua (SUPER + U)
-  - ~/.config/systemd/user/foot-server@.service (parameterized foot server unit)
+  - ~/.config/systemd/user/foot-dropdown-terminal.service (foot server unit)
 
 Design guarantees:
   - Every rewrite is atomic: temp file + os.replace, preserving mode/ownership.
@@ -191,14 +191,21 @@ BINDINGS_LUA = os.path.join(HYPRLAND_DIR, "bindings.lua")
 LOCK_PATH = os.path.join(HYPRLAND_DIR, ".dropdown-terminal.lock")
 
 SYSTEMD_USER_DIR = os.path.join(_validated_config_dir(), "systemd", "user")
-UNIT_SRC_NAME = "foot-server@.service"
-UNIT_DST_PATH = os.path.join(SYSTEMD_USER_DIR, UNIT_SRC_NAME)
-UNIT_INSTANCE = "dropdown-terminal"
-UNIT_REF = f"foot-server@{UNIT_INSTANCE}.service"
-# The unit binds `--server=%t/foot-%i.sock`; with our instance that is this name.
-# Kept as a constant so the CLI's socket path and the unit cannot drift apart
-# (a test substitutes UNIT_INSTANCE into the unit template and compares).
-FOOT_SOCKET_NAME = f"foot-{UNIT_INSTANCE}.sock"
+# Plugin-owned unit name. NEVER the generic foot-server@.service template: a file
+# with that name in the user config dir shadows every foot-server@<instance> this
+# user starts, so writing it would change unrelated foot servers.
+UNIT_NAME = "foot-dropdown-terminal.service"
+UNIT_DST_PATH = os.path.join(SYSTEMD_USER_DIR, UNIT_NAME)
+UNIT_REF = UNIT_NAME
+# 0.1.x wrote the generic template name; install migrates (and uninstall removes)
+# that file only when it carries our marker. Kept separate so the shared name is
+# never written again.
+LEGACY_UNIT_SRC_NAME = "foot-server@.service"
+LEGACY_UNIT_DST_PATH = os.path.join(SYSTEMD_USER_DIR, LEGACY_UNIT_SRC_NAME)
+LEGACY_UNIT_REF = "foot-server@dropdown-terminal.service"
+FOOT_SOCKET_NAME = "foot-dropdown-terminal.sock"
+# Suffix for copies of foreign files taken before this plugin overwrites them.
+BACKUP_SUFFIX = ".pre-dropdown-terminal.bak"
 
 DROPDOWN_APP_ID = "org.omarchy.dropdown-terminal"
 DROPDOWN_WS = "dropdown"
@@ -218,13 +225,13 @@ def unit_body(foot):
     return f"""\
 {UNIT_BEGIN}
 [Unit]
-Description=Foot terminal server (drop-down terminal, instance %i)
+Description=Foot terminal server (drop-down terminal)
 PartOf=graphical-session.target
 After=graphical-session.target
 ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
-ExecStart={foot} --server=%t/foot-%i.sock --app-id={DROPDOWN_APP_ID}
+ExecStart={foot} --server=%t/{FOOT_SOCKET_NAME} --app-id={DROPDOWN_APP_ID}
 Restart=on-failure
 NonBlocking=true
 UnsetEnvironment=LISTEN_PID LISTEN_FDS LISTEN_FDNAMES
@@ -526,6 +533,117 @@ def atomic_write(path, content, mode=0o644):
             os.unlink(tmp_path)
 
 
+def _file_mode(path, default=0o600):
+    """Permission bits of a regular file (following a dotfiles symlink), else default."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return default
+    if not stat_module.S_ISREG(st.st_mode):
+        return default
+    return stat_module.S_IMODE(st.st_mode) & 0o777
+
+
+def _backup_existing(path, content=None):
+    """Copy a foreign config file aside before this plugin overwrites it.
+
+    The copy carries the SOURCE file's permission bits: a private 0600 unit or
+    rules file must not become a 0644 backup readable by every local user. When the
+    source mode cannot be read, 0600 is the safe fallback (never wider than the
+    original). A symlink planted at the backup path is removed first, so the copy is
+    written at the backup path itself and never through someone else's link; an
+    existing regular backup is the first backup and is kept as-is.
+    """
+    if content is None:
+        content = read_text(path)
+    if content is None:
+        return None
+    backup = path + BACKUP_SUFFIX
+    if os.path.lexists(backup):
+        if not os.path.islink(backup):
+            return backup
+        os.unlink(backup)
+    atomic_write(backup, content, mode=_file_mode(path))
+    print(f"backed up existing {path} -> {backup}")
+    return backup
+
+
+def _restore_backup(path):
+    """Restore `path` from its backup, preserving the backup's mode.
+
+    Returns True when a file was restored. The backup is removed afterwards so the
+    next install takes a fresh copy of whatever the user has by then. A symlink at
+    the backup path is never followed.
+    """
+    backup = path + BACKUP_SUFFIX
+    if not os.path.exists(backup) or os.path.islink(backup):
+        return False
+    content = read_text(backup)
+    if content is None:
+        return False
+    atomic_write(path, content, mode=_file_mode(backup))
+    os.unlink(backup)
+    return True
+
+
+def _remove_unit_file(path, key, results):
+    """Remove a unit file only when it is ours; restore a displaced original.
+
+    A foreign file the user put at this path after install (or one that was never
+    ours) is left untouched: uninstall must never delete someone else's unit.
+    """
+    text = read_text(path)
+    if text is None:
+        if _restore_backup(path):
+            results[key] = "absent; backup restored"
+        else:
+            results[key] = "absent"
+        return
+    if MARKER not in text:
+        results[key] = "skipped: not ours, leaving in place"
+        return
+    os.unlink(path)
+    if _restore_backup(path):
+        results[key] = "removed; backup restored"
+    else:
+        results[key] = "removed"
+
+
+def _stop_unit(ref):
+    """Stop, disable and unmask a user unit, waiting out Restart=on-failure."""
+    _call("systemctl", "--user", "unmask", ref)
+    _call("systemctl", "--user", "disable", "--now", ref)
+    for _ in range(20):
+        if _call("systemctl", "--user", "is-active", ref).stdout.strip() != "active":
+            break
+        time.sleep(0.25)
+    _call("systemctl", "--user", "kill", "--kill-whom=main", ref)
+
+
+def _remove_legacy_unit(results):
+    """Drop the 0.1.x generic foot-server@.service template, if it is ours.
+
+    A foreign file (no marker) is never touched - it is the user's own template,
+    possibly serving other foot instances. When ours is removed, a displaced
+    original is restored with its original mode.
+    """
+    text = read_text(LEGACY_UNIT_DST_PATH)
+    if text is None:
+        if _restore_backup(LEGACY_UNIT_DST_PATH):
+            results["legacy_unit"] = "backup restored"
+        return
+    if MARKER not in text:
+        results["legacy_unit"] = "kept: not ours"
+        return
+    _stop_unit(LEGACY_UNIT_REF)
+    os.unlink(LEGACY_UNIT_DST_PATH)
+    if _restore_backup(LEGACY_UNIT_DST_PATH):
+        results["legacy_unit"] = "removed; backup restored"
+    else:
+        results["legacy_unit"] = "removed"
+    _call("systemctl", "--user", "daemon-reload")
+
+
 class ConfigUnreadable(RuntimeError):
     """A config file exists but cannot be read (or is absurdly large).
 
@@ -652,7 +770,7 @@ def check_keybind_conflict():
 
 
 def install_unit(foot=None):
-    """Install the foot-server@ template unit, backing up a foreign file."""
+    """Install the plugin-owned foot server unit, backing up a foreign file."""
     if foot is None:
         foot = proc.resolve("foot")
     if foot is None:
@@ -660,13 +778,10 @@ def install_unit(foot=None):
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
     existing = read_text(UNIT_DST_PATH)
     if existing is not None and MARKER not in existing:
-        backup = UNIT_DST_PATH + ".pre-dropdown-terminal.bak"
         # atomic_write (mkstemp + replace) rather than open(..., "wb"): a plantable
         # symlink at the backup path must be replaced, not followed to a file of
         # someone else's choosing. read_text already bounded and validated the source.
-        if not os.path.exists(backup) or os.path.islink(backup):
-            atomic_write(backup, existing)
-            print(f"backed up existing {UNIT_DST_PATH} -> {backup}")
+        _backup_existing(UNIT_DST_PATH, existing)
     atomic_write(UNIT_DST_PATH, unit_body(foot))
     _call("systemctl", "--user", "daemon-reload")
     return True
@@ -686,7 +801,16 @@ def install(quiet=False):
     #     nothing half-applied - including this plugin's own rules file, which used to
     #     be written before the check. The keybind body is built here too, so a HOME
     #     that cannot be written into a keybind aborts before the first write.
-    for path in (UNIT_DST_PATH, HYPRLAND_LUA, BINDINGS_LUA, RULES_PATH):
+    for path in (
+        UNIT_DST_PATH,
+        LEGACY_UNIT_DST_PATH,
+        HYPRLAND_LUA,
+        BINDINGS_LUA,
+        RULES_PATH,
+        UNIT_DST_PATH + BACKUP_SUFFIX,
+        LEGACY_UNIT_DST_PATH + BACKUP_SUFFIX,
+        RULES_PATH + BACKUP_SUFFIX,
+    ):
         read_text(path)
     require_config_dir()
     bind_body()
@@ -711,10 +835,7 @@ def install(quiet=False):
     #    without our marker is backed up first, the same way a foreign unit is.
     existing_rules = read_text(RULES_PATH)
     if existing_rules is not None and RULES_BEGIN not in existing_rules:
-        backup = RULES_PATH + ".pre-dropdown-terminal.bak"
-        if not os.path.exists(backup) or os.path.islink(backup):
-            atomic_write(backup, existing_rules)
-            print(f"backed up existing {RULES_PATH} -> {backup}")
+        _backup_existing(RULES_PATH, existing_rules)
     atomic_write(RULES_PATH, RULES_BODY)
     results["rules_file"] = RULES_PATH
 
@@ -745,7 +866,10 @@ def install(quiet=False):
             ("added" if not had_block else "updated") if changed else "already-installed"
         )
 
-    # 4. systemd unit (with the validated foot path) + enable.
+    # 4. systemd unit (with the validated foot path) + enable. The 0.1.x shared
+    #    template is dropped first so its server (on the same socket) is stopped
+    #    before the new unit binds.
+    _remove_legacy_unit(results)
     install_unit(tools["foot"])
     enable_server()
     results["unit"] = UNIT_REF
@@ -763,16 +887,20 @@ def uninstall():
     # unreadable file - or an XDG_CONFIG_HOME that fails validation at write time -
     # must not leave the unit disabled+masked with our blocks still installed.
     require_config_dir()
-    for path in (UNIT_DST_PATH, HYPRLAND_LUA, BINDINGS_LUA, RULES_PATH):
+    for path in (
+        UNIT_DST_PATH,
+        LEGACY_UNIT_DST_PATH,
+        HYPRLAND_LUA,
+        BINDINGS_LUA,
+        RULES_PATH,
+        UNIT_DST_PATH + BACKUP_SUFFIX,
+        LEGACY_UNIT_DST_PATH + BACKUP_SUFFIX,
+        RULES_PATH + BACKUP_SUFFIX,
+    ):
         read_text(path)
 
     # 1. Stop + disable the server (ordered to defeat Restart respawn).
-    _call("systemctl", "--user", "disable", "--now", UNIT_REF)
-    for _ in range(20):
-        if _call("systemctl", "--user", "is-active", UNIT_REF).stdout.strip() != "active":
-            break
-        time.sleep(0.25)
-    _call("systemctl", "--user", "kill", "--kill-whom=main", UNIT_REF)
+    _stop_unit(UNIT_REF)
     try:
         _call("systemctl", "--user", "mask", UNIT_REF)
         results["unit"] = "stopped+disabled+masked"
@@ -791,35 +919,35 @@ def uninstall():
         try:
             rules_text = read_text(RULES_PATH)
             if rules_text is None:
-                results["rules_file"] = "absent"
+                if _restore_backup(RULES_PATH):
+                    results["rules_file"] = "absent; backup restored"
+                else:
+                    results["rules_file"] = "absent"
             elif RULES_BEGIN not in rules_text:
                 # Not ours (a foreign file replaced it after install, or install
                 # never wrote it): leave it alone, never delete someone else's config.
                 results["rules_file"] = "skipped: not ours, leaving in place"
             else:
                 os.unlink(RULES_PATH)
-                results["rules_file"] = "removed"
-                backup = RULES_PATH + ".pre-dropdown-terminal.bak"
-                if os.path.exists(backup) and not os.path.islink(backup):
-                    try:
-                        atomic_write(RULES_PATH, read_text(backup) or "")
-                        results["rules_file"] = "restored from backup"
-                    except (OSError, ValueError, ConfigUnreadable, SystemExit) as exc:
-                        results["rules_file"] = f"removed, backup restore skipped: {exc}"
+                if _restore_backup(RULES_PATH):
+                    results["rules_file"] = "restored from backup"
+                else:
+                    results["rules_file"] = "removed"
         except FileNotFoundError:
             results["rules_file"] = "absent"
-        except OSError as exc:
+        except (OSError, ValueError, ConfigUnreadable, SystemExit) as exc:
             results["rules_file"] = f"skipped: {exc}"
 
-        # 3. Remove unit file.
+        # 3. Remove the plugin unit and the 0.1.x shared template, each only when
+        #    it carries our marker, restoring any displaced original.
         try:
-            try:
-                os.unlink(UNIT_DST_PATH)
-                results["unit_file"] = "removed"
-            except FileNotFoundError:
-                results["unit_file"] = "absent"
-        except OSError as exc:
+            _remove_unit_file(UNIT_DST_PATH, "unit_file", results)
+        except (OSError, ValueError, ConfigUnreadable, SystemExit) as exc:
             results["unit_file"] = f"skipped: {exc}"
+        try:
+            _remove_legacy_unit(results)
+        except (OSError, ValueError, ConfigUnreadable, SystemExit) as exc:
+            results["legacy_unit"] = f"skipped: {exc}"
     finally:
         # A masked unit must never survive an uninstall (it would block a reinstall),
         # whatever happened above.
@@ -936,8 +1064,8 @@ def runtime_paths(ancestor_uids=None):
 def socket_path(ancestor_uids=None):
     """The foot client socket path, in the directory the UNIT actually binds.
 
-    The name must stay in step with `--server=%t/foot-%i.sock` for instance
-    `dropdown-terminal`, and the DIRECTORY must be systemd's %t (/run/user/<uid>),
+    The name must stay in step with the unit's `--server=%t/foot-dropdown-terminal.sock`,
+    and the DIRECTORY must be systemd's %t (/run/user/<uid>),
     which does not follow this process's XDG_RUNTIME_DIR. If %t cannot be validated
     the validated XDG_RUNTIME_DIR is used, but loudly: silently dialing a directory
     the unit never bound would make the terminal fail with no explanation.
